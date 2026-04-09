@@ -9,12 +9,15 @@ export async function middleware(request: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        getAll() { return request.cookies.getAll() },
-        setAll(cookiesToSet) {
+        getAll() {
+          return request.cookies.getAll()
+        },
+        setAll(cookiesToSet: { name: string; value: string; options?: Record<string, unknown> }[]) {
           cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
           supabaseResponse = NextResponse.next({ request })
           cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            supabaseResponse.cookies.set(name, value, options as any)
           )
         },
       },
@@ -22,15 +25,13 @@ export async function middleware(request: NextRequest) {
   )
 
   const { data: { user } } = await supabase.auth.getUser()
+  const path = request.nextUrl.pathname
+  const isPublic = path === '/' || path === '/login' || path.startsWith('/_next') || path.startsWith('/favicon')
 
-  const isLoginPage   = request.nextUrl.pathname === '/login'
-  const isPublicAsset = request.nextUrl.pathname.startsWith('/_next')
-
-  if (!user && !isLoginPage && !isPublicAsset) {
-    return NextResponse.redirect(new URL('/login', request.url))
+  if (!user && !isPublic) {
+    return NextResponse.redirect(new URL('/', request.url))
   }
-
-  if (user && isLoginPage) {
+  if (user && (path === '/' || path === '/login')) {
     return NextResponse.redirect(new URL('/dashboard', request.url))
   }
 
@@ -38,5 +39,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/bot/status|api/delivery).*)'],
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
 }

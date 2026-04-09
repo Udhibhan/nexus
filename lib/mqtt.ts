@@ -1,6 +1,7 @@
-import mqtt, { MqttClient } from 'mqtt'
+'use client'
+import type { MqttClient } from 'mqtt'
 
-const PREFIX = process.env.NEXT_PUBLIC_MQTT_TOPIC_PREFIX || 'mbot_epp'
+const PREFIX = process.env.NEXT_PUBLIC_MQTT_TOPIC_PREFIX || 'mbot_epp_2025'
 
 export const TOPICS = {
   command: `${PREFIX}/command`,
@@ -9,10 +10,11 @@ export const TOPICS = {
 
 let client: MqttClient | null = null
 
-export function getMqttClient(): MqttClient {
+export async function getMqttClient(): Promise<MqttClient> {
   if (client && client.connected) return client
 
-  client = mqtt.connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
+  const { connect } = await import('mqtt')
+  client = connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
     clientId: `mbot_web_${Math.random().toString(16).slice(2, 8)}`,
     username: process.env.NEXT_PUBLIC_MQTT_USERNAME,
     password: process.env.NEXT_PUBLIC_MQTT_PASSWORD,
@@ -23,7 +25,7 @@ export function getMqttClient(): MqttClient {
   return client
 }
 
-export function publishCommand(cmd: object) {
-  const c = getMqttClient()
+export async function publishCommand(cmd: object) {
+  const c = await getMqttClient()
   c.publish(TOPICS.command, JSON.stringify(cmd), { qos: 1 })
 }
