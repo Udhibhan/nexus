@@ -3,7 +3,7 @@ import { useEffect, useRef, useCallback } from 'react'
 import type { MqttClient } from 'mqtt'
 import type { MqttCommand, MqttEvent } from '../types'
 
-const PREFIX = process.env.NEXT_PUBLIC_MQTT_TOPIC_PREFIX ?? 'mbot_epp_2024'
+const PREFIX = process.env.NEXT_PUBLIC_MQTT_TOPIC_PREFIX ?? 'mbot_epp_2025'
 export const TOPIC_CMD    = `${PREFIX}/command`
 export const TOPIC_STATUS = `${PREFIX}/status`
 
@@ -17,12 +17,13 @@ export function useMqtt(onEvent: EventHandler) {
   useEffect(() => {
     let mounted = true
 
-    // Dynamic import so it only runs client-side
     import('mqtt').then(({ connect }) => {
       if (!mounted) return
 
-      const client = connect(process.env.NEXT_PUBLIC_MQTT_BROKER!, {
+      const client = connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
         clientId: `mbot_web_${Math.random().toString(16).slice(2, 8)}`,
+        username: process.env.NEXT_PUBLIC_MQTT_USERNAME,
+        password: process.env.NEXT_PUBLIC_MQTT_PASSWORD,
         clean: true,
         reconnectPeriod: 3000,
       })

@@ -56,9 +56,15 @@ export type MqttCommand =
 // MQTT status events sent from Arduino R4 → website
 export type MqttStatusEvent =
   | 'arrived_pickup'
+  | 'arrived_location'
   | 'load_detected'
   | 'load_removed'
   | 'arrived_delivery'
   | 'box_opened'
   | 'wrong_passcode'
   | 'arrived_home'
+
+// Shape of the JSON object published on the status topic
+export interface MqttEvent {
+  event: MqttStatusEvent
+}
