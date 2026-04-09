@@ -1,39 +1,39 @@
 // lib/locations.ts
-// These match exactly what's in supabase/schema.sql seed data.
-// To change coordinates: update both this file AND the Supabase locations table.
+// Fallback static locations used if Supabase fetch fails.
+// Keep in sync with supabase/seed.sql and arduino_r4.ino locationToByte().
 
 import type { Location } from './types'
 
 export const LOCATIONS: Record<string, Location> = {
   homebase: {
     id: 'homebase',
-    name: 'Homebase',
+    label: 'Home Base',
     x: 0, y: 0,
-    location_byte: 0x00,
+    is_home: true,
   },
   engineers_office: {
     id: 'engineers_office',
-    name: "Engineer's Office",
+    label: "Engineers Office",
     x: 0, y: 2,
-    location_byte: 0x01,
+    is_home: false,
   },
   storage_base: {
     id: 'storage_base',
-    name: 'Storage Base',
+    label: 'Storage Base',
     x: 2, y: 1,
-    location_byte: 0x02,
+    is_home: false,
   },
   marine_port: {
     id: 'marine_port',
-    name: 'Marine Port',
+    label: 'Marine Port',
     x: 3, y: 2,
-    location_byte: 0x03,
+    is_home: false,
   },
   admin_office: {
     id: 'admin_office',
-    name: 'Admin Office',
+    label: 'Admin Office',
     x: 1, y: 1,
-    location_byte: 0x04,
+    is_home: false,
   },
 }
 
@@ -43,5 +43,4 @@ export function getLocation(id: string): Location | undefined {
   return LOCATIONS[id]
 }
 
-// Locations the bot can be called to / sent to (excludes homebase)
-export const DELIVERY_LOCATIONS = LOCATION_LIST.filter(l => l.id !== 'homebase')
+export const DELIVERY_LOCATIONS = LOCATION_LIST.filter(l => !l.is_home)
