@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
+  transpilePackages: ['mqtt'],
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve.fallback = {
@@ -13,6 +14,8 @@ const nextConfig = {
         crypto: false,
         stream: false,
         buffer: false,
+        dns: false,
+        assert: false,
       }
     }
     return config
