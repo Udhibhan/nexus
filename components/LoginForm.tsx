@@ -1,10 +1,8 @@
 'use client'
 import { useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
 
 export default function LoginForm() {
-  const router = useRouter()
   const supabase = createClient()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -15,18 +13,17 @@ export default function LoginForm() {
     setLoading(true)
     setError('')
 
-    // CRITICAL: Sign out any existing session first so a different user can log in
-    // on the same browser without inheriting the previous session's cookies.
-    await supabase.auth.signOut()
-
+    // NOTE: We do NOT signOut() first. signOut() is global — it kills ALL tabs'
+    // sessions simultaneously (shared cookie), which caused the cross-tab bug.
+    // The new signIn naturally replaces the existing session cookie.
     const { error } = await supabase.auth.signInWithPassword({ email, password })
     if (error) {
       setError(error.message)
       setLoading(false)
     } else {
-      // router.refresh() forces Next.js to re-run server components with the new session
-      router.refresh()
-      router.push('/dashboard')
+      // Hard redirect instead of router.push — forces the browser to send the
+      // new session cookie to the server fresh, bypassing Next.js router cache.
+      window.location.replace('/dashboard')
     }
   }
 
