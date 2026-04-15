@@ -213,6 +213,40 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     return () => { supabase.removeChannel(ch) }
   }, [userId])
 
+  // ── Recipient delivery poll ──────────────────────────────────────────────
+  // Realtime sometimes misses the delivery assignment (RLS timing: the row is
+  // created without recipient_id, then updated to add it — the initial INSERT
+  // notification goes out before the recipient is set, so the client may never
+  // get the UPDATE). This poll is the safety net: every 3s check if a delivery
+  // has been assigned to this user as recipient.
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      // Skip if we already have an active delivery for this user as recipient
+      if (deliveryRef.current?.recipient_id === userId &&
+          ['in_transit','at_delivery'].includes(deliveryRef.current?.status || '')) return
+
+      const { data } = await supabase
+        .from('deliveries')
+        .select('*')
+        .eq('recipient_id', userId)
+        .in('status', ['in_transit', 'at_delivery'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (data && data.id !== deliveryRef.current?.id) {
+        setDelivery(data)
+        deliveryRef.current = data
+        addLog(`Poll: incoming delivery found → ${data.status}`)
+        setShowOtpModal(true)
+        setRecipientInput('')
+        setRecipientAttempts(0)
+        setRecipientLocked(false)
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [userId])
+
   // ── Event handler (always current via ref) ────────────────────────────────
   const handleEvent = useCallback(async (event: string) => {
     addLog(`HW Event: ${event}`)
