@@ -48,17 +48,20 @@ export interface BotState {
 // MQTT command payloads sent from website → Arduino R4
 export type MqttCommand =
   | { action: 'call';        pickup: string }
-  | { action: 'deliver';     delivery: string; passcode: string }
+  | { action: 'deliver';     delivery: string }
   | { action: 'return_home' }
+  | { action: 'open_lid' }
+  | { action: 'close_lid' }
 
 // MQTT status events sent from Arduino R4 → website
 export type MqttStatusEvent =
+  | 'arrived_pickup'
   | 'arrived_location'
   | 'load_detected'
   | 'load_removed'
+  | 'arrived_delivery'
   | 'box_opened'
   | 'wrong_passcode'
-  | 'wrong_passcode_locked'
   | 'arrived_home'
 
 // Shape of the JSON object published on the status topic

@@ -1,127 +1,81 @@
-// ============================================================
-//  mbot.ino  —  mbot (mCore / ATmega328P)
-//
-//  Responsibilities:
-//    - Line-following grid navigation
-//    - LCD display (I2C on mCore SDA/SCL, addr 0x27)
-//    - Binary serial protocol with Arduino R4 @ 9600 baud
-//
-//  Wiring:
-//    Line follower   : PORT_2
-//    Motors          : M1 (left), M2 (right)
-//    LCD 16x2 I2C    : SDA + SCL + GND + 5V on mCore
-//    R4 TX1 (pin 1)  : mCore RX (pin 0)
-//    R4 RX1 (pin 0)  : mCore TX (pin 1)
-//    ** Unplug mCore USB while R4 serial wires are connected **
-//
-//  Grid design expected:
-//    White squares at each node, black lines connecting them.
-//    lineFinder.readSensors() == 3  →  both on white = AT A NODE
-//    lineFinder.readSensors() == 1  →  left on black only
-//    lineFinder.readSensors() == 2  →  right on black only
-//
-//  Heading convention:
-//    0 = North (+Y)   1 = East (+X)   2 = South (-Y)   3 = West (-X)
-// ============================================================
-
 #include <MeMCore.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
-// ── Hardware ─────────────────────────────────────────────────
-MeLineFollower    lineFinder(PORT_2);
-MeDCMotor         leftMotor(M1);
-MeDCMotor         rightMotor(M2);
-LiquidCrystal_I2C lcd(0x3F, 16, 2);   // change to 0x27 if still blank
+MeLineFollower lineFinder(PORT_2);
+MeDCMotor leftMotor(M1);
+MeDCMotor rightMotor(M2);
 
-// ── Motion tuning ────────────────────────────────────────────
-// Adjust TURN_TIME_90 until a 90° in-place turn is exact on your surface.
-#define BASE_SPEED       175
-#define TURN_SPEED       140
-#define TURN_TIME_90     750    // ms for 90° pivot
-#define NODE_DEBOUNCE    600    // ms — ignore re-trigger after node hit
-#define CENTER_SPEED     135
+// ===== Motion tuning =====
+#define BASE_SPEED        175
+#define TURN_SPEED        140
+#define TURN_TIME_90      750
+#define NODE_DEBOUNCE     600
+#define CENTER_SPEED      135
 #define POST_TURN_DELAY   80
 
-#define CLEAR_MIN_MS     320
-#define CLEAR_MAX_MS     650
-#define CLEAR_CONFIRM_MS  35
-#define CLEAR_STOP_MS     40
+#define CLEAR_MIN_PUSH_MS    320
+#define CLEAR_MAX_PUSH_MS    650
+#define CLEAR_CONFIRM_MS      35
+#define CLEAR_STOP_MS         40
 
-#define PID_DT_MS          2
-float Kp = 120.0f, Kd = 20.0f, lastError = 0.0f;
-#define MAX_CORRECTION    90
+#define PID_DT_MS 2
 
-// ── Position / heading ───────────────────────────────────────
-int  currentX    = 0;
-int  currentY    = 0;
-int  heading     = 0;   // 0=N 1=E 2=S 3=W
+float Kp = 120;
+float Kd = 20;
+float lastError = 0;
+#define MAX_CORRECTION 90
+
+int currentX = 0;
+int currentY = 0;
+int heading   = 0; // 0=N,1=E,2=S,3=W
+bool expectingCoord = false;
+// Track what phase the bot is in
+// 0 = idle at home
+// 1 = went to pickup, waiting for delivery command
+// 2 = went to delivery, waiting for passcode confirmation
+int botPhase = 0;
+
 unsigned long lastNodeTime = 0;
 
-// ── Serial protocol (R4 ↔ mbot) ──────────────────────────────
-// From R4:
-#define CMD_GOTO        0xA1   // followed by 1 coord byte: (x<<4)|y
-#define CMD_RETURN_HOME 0xC1
-#define CMD_LCD_CLEAR   0xF0
-#define CMD_LCD_LINE0   0xF1   // followed by exactly 16 bytes (space-padded)
-#define CMD_LCD_LINE1   0xF2   // followed by exactly 16 bytes (space-padded)
-// To R4:
-#define EVT_ARRIVED     0xD1   // followed by 1 coord byte
-
-// ── Parser state ─────────────────────────────────────────────
-bool expectingCoord  = false;
-bool inLcdCmd        = false;
-int  lcdRow          = 0;
-int  lcdBytesRead    = 0;
-char lcdBuf[17];
-
-// ──────────────────────────────────────────────────────────────
-//  Motors
-// ──────────────────────────────────────────────────────────────
-void setMotor(int l, int r) {
-  leftMotor.run(-constrain(l, -255, 255));
-  rightMotor.run( constrain(r, -255, 255));
+// ── Motors ──────────────────────────────────────────────
+void setMotor(int left, int right) {
+  leftMotor.run(-constrain(left,  -255, 255));
+  rightMotor.run( constrain(right, -255, 255));
 }
 void stopMotors() { setMotor(0, 0); }
 
-// ──────────────────────────────────────────────────────────────
-//  PID
-// ──────────────────────────────────────────────────────────────
-float sensorErr(int s) {
-  if (s == 2) return  1.0f;
-  if (s == 1) return -1.0f;
-  return 0.0f;
-}
-void pidStep(int spd) {
-  int   s    = lineFinder.readSensors();
-  float err  = sensorErr(s);
-  float dErr = err - lastError;
-  if (abs(dErr) > 1.5f) dErr = 0;
-  float corr = constrain(Kp * err + Kd * dErr,
-                         -(float)MAX_CORRECTION, (float)MAX_CORRECTION);
-  lastError = err;
-  setMotor((int)(spd + corr), (int)(spd - corr));
+// ── PID ─────────────────────────────────────────────────
+float sensorErrorFrom(int s) {
+  if (s == 2) return  1;
+  if (s == 1) return -1;
+  return 0;
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Intersection helpers
-// ──────────────────────────────────────────────────────────────
-// Push bot forward past the current node marker before a turn.
+void pidStep(int baseSpeed) {
+  int s = lineFinder.readSensors();
+  float error = sensorErrorFrom(s);
+  float dError = error - lastError;
+  if (abs(dError) > 1.5) dError = 0;
+  float correction = constrain(Kp * error + Kd * dError, -MAX_CORRECTION, MAX_CORRECTION);
+  lastError = error;
+  setMotor((int)(baseSpeed + correction), (int)(baseSpeed - correction));
+}
+
+// ── Clear node before turns ──────────────────────────────
 void clearNodeBeforeTurn() {
   lastError = 0;
   unsigned long t0 = millis();
   setMotor(CENTER_SPEED, CENTER_SPEED);
-  while (millis() - t0 < CLEAR_MIN_MS) delay(PID_DT_MS);
+  while (millis() - t0 < CLEAR_MIN_PUSH_MS) delay(PID_DT_MS);
 
-  unsigned long offStart = 0;
+  unsigned long offNodeStart = 0;
   t0 = millis();
-  while (millis() - t0 < CLEAR_MAX_MS) {
+  while (millis() - t0 < CLEAR_MAX_PUSH_MS) {
     int s = lineFinder.readSensors();
     if (s != 3) {
-      if (!offStart) offStart = millis();
-      if (millis() - offStart >= CLEAR_CONFIRM_MS) break;
+      if (offNodeStart == 0) offNodeStart = millis();
+      if (millis() - offNodeStart >= CLEAR_CONFIRM_MS) break;
     } else {
-      offStart = 0;
+      offNodeStart = 0;
     }
     setMotor(CENTER_SPEED, CENTER_SPEED);
     delay(PID_DT_MS);
@@ -131,7 +85,6 @@ void clearNodeBeforeTurn() {
   lastError = 0;
 }
 
-// Nudge forward to center over a freshly-detected node.
 void centerOverNode() {
   lastError = 0;
   unsigned long t = millis();
@@ -145,10 +98,8 @@ void centerOverNode() {
   lastError = 0;
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Turns
-// ──────────────────────────────────────────────────────────────
-void doTurnRight() {
+// ── Turns ────────────────────────────────────────────────
+void executeTurnRight() {
   leftMotor.run(-TURN_SPEED);
   rightMotor.run(-TURN_SPEED);
   delay(TURN_TIME_90);
@@ -156,7 +107,8 @@ void doTurnRight() {
   delay(POST_TURN_DELAY);
   lastError = 0;
 }
-void doTurnLeft() {
+
+void executeTurnLeft() {
   leftMotor.run(TURN_SPEED);
   rightMotor.run(TURN_SPEED);
   delay(TURN_TIME_90);
@@ -165,40 +117,36 @@ void doTurnLeft() {
   lastError = 0;
 }
 
-void turnTo(int target) {
-  int diff = (target - heading + 4) % 4;
-  if (diff == 0) { heading = target; return; }  // already facing right way — no clear needed
+void turnTo(int targetHeading) {
   clearNodeBeforeTurn();
-  if      (diff == 1) doTurnRight();
-  else if (diff == 3) doTurnLeft();
-  else                { doTurnRight(); doTurnRight(); }  // 180°
-  heading = target;
+  int diff = (targetHeading - heading + 4) % 4;
+  if      (diff == 1) executeTurnRight();
+  else if (diff == 3) executeTurnLeft();
+  else if (diff == 2) { executeTurnRight(); executeTurnRight(); }
+  heading = targetHeading;
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Move one node
-// ──────────────────────────────────────────────────────────────
-void updatePos() {
+// ── Forward one node ─────────────────────────────────────
+void updatePositionAfterNode() {
   if      (heading == 0) currentY++;
   else if (heading == 1) currentX++;
   else if (heading == 2) currentY--;
-  else                   currentX--;
+  else if (heading == 3) currentX--;
 }
 
 void moveForwardOneNode() {
   lastError = 0;
-  // Phase 1: creep off current node (sensors on white, s==3) → onto path
-  unsigned long t = millis();
-  while (millis() - t < 600) {
+  unsigned long creepStart = millis();
+  while (millis() - creepStart < 600) {
     if (lineFinder.readSensors() != 3) break;
     setMotor(CENTER_SPEED, CENTER_SPEED);
     delay(PID_DT_MS);
   }
   lastError = 0;
-  // Phase 2: PID along path until next node marker (s==3 again, debounced)
+
   while (true) {
     int s = lineFinder.readSensors();
-    if (s == 3 && (millis() - lastNodeTime) > NODE_DEBOUNCE) {
+    if (s == 3 && millis() - lastNodeTime > NODE_DEBOUNCE) {
       lastNodeTime = millis();
       stopMotors();
       break;
@@ -206,111 +154,86 @@ void moveForwardOneNode() {
     pidStep(BASE_SPEED);
     delay(PID_DT_MS);
   }
-  updatePos();
+
+  updatePositionAfterNode();
   centerOverNode();
   stopMotors();
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Navigation: Y first, then X
-// ──────────────────────────────────────────────────────────────
-void goToLeg(int tx, int ty) {
-  if      (ty > currentY) turnTo(0);
-  else if (ty < currentY) turnTo(2);
-  while (currentY != ty) moveForwardOneNode();
+// ── Navigation ───────────────────────────────────────────
+void goToLeg(int targetX, int targetY) {
+  if (targetY > currentY) turnTo(0);
+  else if (targetY < currentY) turnTo(2);
+  while (currentY != targetY) moveForwardOneNode();
 
-  if      (tx > currentX) turnTo(1);
-  else if (tx < currentX) turnTo(3);
-  while (currentX != tx) moveForwardOneNode();
+  if (targetX > currentX) turnTo(1);
+  else if (targetX < currentX) turnTo(3);
+  while (currentX != targetX) moveForwardOneNode();
 
   stopMotors();
   delay(120);
 }
 
-void goTo(int tx, int ty) {
-  if (ty != currentY && tx != currentX) {
-    goToLeg(currentX, ty);  // Y leg first (keep X fixed)
-    goToLeg(tx,       ty);  // X leg
+void goTo(int targetX, int targetY) {
+  if (targetY != currentY && targetX != currentX) {
+    goToLeg(currentX, targetY);
+    goToLeg(targetX, targetY);
   } else {
-    goToLeg(tx, ty);
+    goToLeg(targetX, targetY);
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Binary command handler (called from loop)
-// ──────────────────────────────────────────────────────────────
-void handleByte(byte b) {
+// ── Serial command handler ───────────────────────────────
+void handleBinaryCommand(byte b) {
+  if (expectingCoord) {
+    expectingCoord = false;
+    // Unpack (x << 4) | y
+    int x = b >> 4;
+    int y = b & 0x0F;
 
-  // Accumulate LCD payload (fixed 16-byte rows)
-  if (inLcdCmd) {
-    lcdBuf[lcdBytesRead++] = (char)b;
-    if (lcdBytesRead >= 16) {
-      lcdBuf[16] = '\0';
-      lcd.setCursor(0, lcdRow);
-      lcd.print(lcdBuf);
-      inLcdCmd = false;
+    goTo(x, y);
+
+    // Report arrival back to R4
+    if (x == 0 && y == 0) {
+      botPhase = 0;
+      Serial.write(0xD1); // EVT_ARRIVED byte
+      Serial.write(0x00); // Home coord (0,0)
+    } else {
+      if (botPhase == 0) botPhase = 1;
+      else if (botPhase == 1) botPhase = 2;
+
+      Serial.write(0xD1); // EVT_ARRIVED byte
+      Serial.write(b);    // Echo back the coord byte it arrived at
     }
     return;
   }
 
-  // Second byte of CMD_GOTO
-  if (expectingCoord) {
-    expectingCoord = false;
-    int x = b >> 4;
-    int y = b & 0x0F;
-    goTo(x, y);
-    Serial.write(EVT_ARRIVED);
-    Serial.write(b);   // echo back the same coord byte
-    return;
-  }
-
   switch (b) {
-    case CMD_GOTO:
+    case 0xA1: // CMD_GOTO
       expectingCoord = true;
       break;
 
-    case CMD_RETURN_HOME:
+    case 0xC1: // CMD_RETURN_HOME
       goTo(0, 0);
-      Serial.write(EVT_ARRIVED);
-      Serial.write((byte)0x00);
+      botPhase = 0;
+      Serial.write(0xD1);
+      Serial.write(0x00);
       break;
 
-    case CMD_LCD_CLEAR:
-      lcd.clear();
-      break;
-
-    case CMD_LCD_LINE0:
-      inLcdCmd     = true;
-      lcdRow       = 0;
-      lcdBytesRead = 0;
-      break;
-
-    case CMD_LCD_LINE1:
-      inLcdCmd     = true;
-      lcdRow       = 1;
-      lcdBytesRead = 0;
-      break;
-
-    default:
-      break;
+    // Add cases for 0xB1 (Open Lid) or 0xB2 (Close Lid) if you have servos
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-//  Setup / Loop
-// ──────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(9600);
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("MBot Ready");
-  lcd.setCursor(0, 1); lcd.print("At Home (0,0)");
   lastNodeTime = millis();
+  // Signal ready
+  Serial.println("READY");
 }
 
 void loop() {
   if (Serial.available()) {
-    handleByte((byte)Serial.read());
+    byte b = Serial.read();
+    handleBinaryCommand(b);
   }
 }
