@@ -649,7 +649,7 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
                         publishCommand({ action: 'wrong_passcode_locked' } as any)
                         showToast('🔒 Locked after 3 wrong attempts')
                       } else {
-                        showToast(\`✕ Wrong passcode — \${attempts}/3 attempts\`)
+                        showToast('✕ Wrong passcode — ' + attempts + '/3 attempts')
                       }
                     }
                   }}
