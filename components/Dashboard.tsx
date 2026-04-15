@@ -182,51 +182,46 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   }, [])
-  async function handleEvent(event: MqttStatusEvent) {
+  async function handleEvent(event: string) {
     addLog(`Hardware Event: ${event}`)
-  
+    
     // Grab current states from refs so we don't get trapped by race conditions
     const status = botStateRef.current?.status;
     const sender = deliveryRef.current?.sender_id;
 
     // 1. ARRIVAL LOGIC
     if (event === 'arrived_location' || event === 'arrived_home') {
-    
-    // If it arrived to pick up the package
+      
       if (status === 'going_pickup') {
         await patchDelivery({ status: 'at_pickup' })
         await patchBot({ status: 'at_pickup' })
       } 
-    // If it arrived to drop off the package
       else if (status === 'in_transit') {
         await patchDelivery({ status: 'at_delivery' })
         await patchBot({ status: 'at_delivery' })
       }
-    // ONLY wipe the delivery if it is ACTUALLY returning home at the end of a trip
       else if (event === 'arrived_home' && (status === 'returning' || status === 'delivered')) {
         await patchBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
         setDelivery(null)
         showToast('Bot back at base.')
       }
+      
     } 
-  
     // 2. LOAD RECEIVED LOGIC
     else if (event === 'load_received') {
-      // ONLY trigger the popup if we are at the pickup station. 
-      // This prevents random load shifts during transit from ruining the state.
+      
       if (status === 'at_pickup' || status === 'loading') {
         await patchDelivery({ status: 'loading', load_detected: true })
-      
+        
         if (sender === userId) {
           setShowSetup(true) 
           showToast('✓ Load secured. Set destination.')
         } else {
           addLog(`Debug: Load received but userId mismatch. User:${userId} Sender:${sender}`)
-          }
         }
       }
+      
     } 
-  
     // 3. PASSCODE CORRECT
     else if (event === 'box_opened') {
       await patchDelivery({ status: 'delivered' })
