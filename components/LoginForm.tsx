@@ -14,9 +14,20 @@ export default function LoginForm() {
   async function login() {
     setLoading(true)
     setError('')
+
+    // CRITICAL: Sign out any existing session first so a different user can log in
+    // on the same browser without inheriting the previous session's cookies.
+    await supabase.auth.signOut()
+
     const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) { setError(error.message); setLoading(false) }
-    else router.push('/dashboard')
+    if (error) {
+      setError(error.message)
+      setLoading(false)
+    } else {
+      // router.refresh() forces Next.js to re-run server components with the new session
+      router.refresh()
+      router.push('/dashboard')
+    }
   }
 
   return (

@@ -26,14 +26,18 @@ export async function middleware(request: NextRequest) {
 
   const { data: { user } } = await supabase.auth.getUser()
   const path = request.nextUrl.pathname
+
+  // Public routes — always accessible.
+  // IMPORTANT: '/' (login page) is intentionally NOT auto-redirected for authenticated users.
+  // This lets a second user log in on the same browser without being hijacked into the first
+  // user's session. LoginForm.login() signs out the old session before signing in the new one.
   const isPublic = path === '/' || path === '/login' || path.startsWith('/_next') || path.startsWith('/favicon')
 
   if (!user && !isPublic) {
     return NextResponse.redirect(new URL('/', request.url))
   }
-  if (user && (path === '/' || path === '/login')) {
-    return NextResponse.redirect(new URL('/dashboard', request.url))
-  }
+
+  // DO NOT redirect authenticated users away from '/'. Let them re-login.
 
   return supabaseResponse
 }

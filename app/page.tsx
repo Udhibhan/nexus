@@ -1,17 +1,19 @@
-import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
 import LoginForm from '@/components/LoginForm'
 
 export default async function HomePage() {
   const supabase = createClient()
-  
-  // Get current session
   const { data: { user } } = await supabase.auth.getUser()
-  
-  // If a user exists, send them to the dashboard
+
+  // Fetch the profile so we can show who is currently logged in (if anyone)
+  let currentName: string | null = null
   if (user) {
-    // We use redirect to avoid any flickering
-    redirect('/dashboard')
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('name')
+      .eq('id', user.id)
+      .single()
+    currentName = profile?.name ?? user.email ?? null
   }
 
   return (
@@ -39,6 +41,24 @@ export default async function HomePage() {
           </h1>
           <div style={{ width: '40px', height: '2px', background: 'var(--amber)', marginTop: '16px' }} />
         </div>
+
+        {/* Show who is currently logged in so users know logging in will switch accounts */}
+        {currentName && (
+          <div style={{
+            marginBottom: '16px',
+            padding: '10px 14px',
+            background: 'rgba(245,158,11,0.08)',
+            border: '1px solid rgba(245,158,11,0.3)',
+            borderRadius: '2px',
+            fontFamily: 'JetBrains Mono, monospace',
+            fontSize: '11px',
+            color: 'var(--amber)',
+          }}>
+            ⚠ Logged in as <strong>{currentName}</strong>.{' '}
+            <a href="/dashboard" style={{ color: 'var(--amber)', textDecoration: 'underline' }}>Go to dashboard</a>
+            {' '}or log in below to switch accounts.
+          </div>
+        )}
 
         {/* This form MUST use the dynamic credentials provided by the user */}
         <LoginForm />

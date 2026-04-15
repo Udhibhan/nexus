@@ -186,46 +186,63 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     addLog(`Hardware Event: ${event}`)
     
     // Grab current states from refs so we don't get trapped by race conditions
-    const status = botStateRef.current?.status;
-    const sender = deliveryRef.current?.sender_id;
+    const status = botStateRef.current?.status
+    const del    = deliveryRef.current
+    const sender = del?.sender_id
 
-    // 1. ARRIVAL LOGIC
+    // ── 1. ARRIVAL LOGIC ────────────────────────────────────────────────────
     if (event === 'arrived_location' || event === 'arrived_home') {
-      
+
       if (status === 'going_pickup') {
-        await patchDelivery({ status: 'at_pickup' })
-        await patchBot({ status: 'at_pickup' })
-      } 
-      else if (status === 'in_transit') {
-        await patchDelivery({ status: 'at_delivery' })
-        await patchBot({ status: 'at_delivery' })
-      }
-      else if (event === 'arrived_home' && (status === 'returning' || status === 'delivered')) {
-        await patchBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
-        setDelivery(null)
-        showToast('Bot back at base.')
-      }
-      
-    } 
-    // 2. LOAD RECEIVED LOGIC
-    else if (event === 'load_received') {
-      
-      if (status === 'at_pickup' || status === 'loading') {
-        await patchDelivery({ status: 'loading', load_detected: true })
-        
+        // Only the sender's client drives state transitions to avoid double-patch
         if (sender === userId) {
-          setShowSetup(true) 
-          showToast('✓ Load secured. Set destination.')
-        } else {
-          addLog(`Debug: Load received but userId mismatch. User:${userId} Sender:${sender}`)
+          await patchDelivery({ status: 'at_pickup' })
+          await patchBot({ status: 'at_pickup' })
         }
       }
-      
-    } 
-    // 3. PASSCODE CORRECT
+      else if (status === 'in_transit') {
+        if (sender === userId) {
+          await patchDelivery({ status: 'at_delivery' })
+          await patchBot({ status: 'at_delivery' })
+        }
+      }
+      else if (event === 'arrived_home' && (status === 'returning' || status === 'delivered')) {
+        if (sender === userId) {
+          await patchBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
+          setDelivery(null)
+        }
+        showToast('Bot back at base.')
+      }
+
+    }
+    // ── 2. LOAD RECEIVED ─────────────────────────────────────────────────────
+    else if (event === 'load_received') {
+
+      if (status === 'at_pickup' || status === 'going_pickup' || status === 'loading') {
+        if (sender === userId) {
+          await patchDelivery({ status: 'loading', load_detected: true })
+          await patchBot({ status: 'loading' })
+          // Show the dispatch modal for the sender
+          setShowSetup(true)
+          showToast('✓ Load secured. Set destination & passcode.')
+        }
+      }
+
+    }
+    // ── 3. PASSCODE CORRECT ───────────────────────────────────────────────────
     else if (event === 'box_opened') {
-      await patchDelivery({ status: 'delivered' })
-      showToast('✓ Passcode Accepted. Opening box.')
+      if (sender === userId) {
+        await patchDelivery({ status: 'delivered' })
+        await patchBot({ status: 'returning' })
+      }
+      showToast('✓ Passcode accepted — box opened!')
+    }
+    // ── 4. WRONG PASSCODE ────────────────────────────────────────────────────
+    else if (event === 'wrong_passcode') {
+      showToast('⚠ Wrong passcode entered on keypad.')
+    }
+    else if (event === 'wrong_passcode_locked') {
+      showToast('🔒 Keypad locked — 3 wrong attempts. Contact admin.')
     }
   }
   async function patchDelivery(patch: Partial<Delivery>) {
@@ -274,7 +291,7 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     showToast('Package dispatched')
   }
 
-  const logout = async () => { await supabase.auth.signOut(); router.push('/') }
+  const logout = async () => { await supabase.auth.signOut(); router.refresh(); router.push('/') }
   const M = { fontFamily: 'JetBrains Mono,monospace' }
 
   return (
@@ -331,12 +348,29 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
                </div>
             )}
 
-            {botStatus === 'in_transit' && <StatusMsg icon="⟶" text="En route to destination..." color="var(--amber)" />}
+            {botStatus === 'in_transit' && !amRecip && <StatusMsg icon="⟶" text="En route to destination..." color="var(--amber)" />}
 
-            {amRecip && delivery?.passcode && (botStatus === 'at_delivery' || botStatus === 'in_transit') && (
-              <div style={{ padding: 16, background: '#0a0a0a', border: '1px solid var(--amber)', borderRadius: 2 }}>
-                <span className="label">Your Collection Code</span>
-                <div style={{ ...M, fontSize: 32, color: 'var(--amber)', letterSpacing: 8, marginTop: 10 }}>{delivery.passcode}</div>
+            {/* ── RECIPIENT OTP PANEL ─────────────────────────────────────────
+                Show as soon as the package is in transit so Yatin has the code
+                ready. Stays visible until the bot returns home. */}
+            {amRecip && delivery?.passcode && isAfterOrEqual(botStatus, 'in_transit') && botStatus !== 'idle' && (
+              <div style={{
+                padding: 20,
+                background: '#0a0a0a',
+                border: '2px solid var(--amber)',
+                borderRadius: 4,
+              }}>
+                <span className="label" style={{ display: 'block', marginBottom: 8 }}>
+                  📦 Your Collection OTP — enter this on the keypad
+                </span>
+                <div style={{ ...M, fontSize: 40, color: 'var(--amber)', letterSpacing: 12, marginTop: 8, fontWeight: 700 }}>
+                  {delivery.passcode}
+                </div>
+                <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 8 }}>
+                  {botStatus === 'at_delivery'
+                    ? '⚡ Bot is at your station. Enter code on the physical keypad.'
+                    : 'Bot is on its way. Get ready.'}
+                </div>
               </div>
             )}
           </div>
