@@ -208,7 +208,10 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         if (['idle', 'returning', 'delivered'].includes(d.status)) {
           setShowSetup(false)
           setShowOtpModal(false)
-          setOtpSubmitted(false) // reset for next delivery
+          setOtpSubmitted(false)
+          setDest('')
+          setRecipient('')
+          setPasscode('')
         }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_state' }, ({ new: r }) => {
@@ -409,6 +412,8 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
     setShowSetup(false)
     setPasscode('')
+    setDest('')        // reset so next delivery starts with blank dropdown
+    setRecipient('')   // same
     addLog(`Dispatched to ${locations.find(l => l.id === destId)?.label}`)
     showToast('Package dispatched')
   }
