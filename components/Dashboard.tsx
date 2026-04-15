@@ -100,7 +100,10 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   const [toast, setToast]             = useState<string | null>(null)
   const [log, setLog]                 = useState<string[]>([])
   const [showSetup, setShowSetup]     = useState(false)   // sender dispatch modal
-  const [showOtpModal, setShowOtpModal] = useState(false) // recipient OTP modal
+  const [showOtpModal, setShowOtpModal]     = useState(false)
+  const [recipientInput, setRecipientInput] = useState('')
+  const [recipientAttempts, setRecipientAttempts] = useState(0)
+  const [recipientLocked, setRecipientLocked]     = useState(false)
   const [recipientId, setRecipient]   = useState('')
   const [destId, setDest]             = useState('')
   const [passcode, setPasscode]       = useState('')
@@ -185,10 +188,16 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         if (d.sender_id === userId && d.status === 'loading') {
           setShowSetup(true)
         }
-        // Recipient: show OTP modal when package is dispatched their way
+        // Recipient: show OTP modal when bot arrives at their station
         if (d.recipient_id === userId && d.passcode &&
             ['in_transit', 'at_delivery'].includes(d.status)) {
           setShowOtpModal(true)
+          // Reset input state when a fresh delivery arrives
+          if (d.status === 'in_transit') {
+            setRecipientInput('')
+            setRecipientAttempts(0)
+            setRecipientLocked(false)
+          }
         }
         // Clean up modals when delivery is done
         if (['idle', 'returning', 'delivered'].includes(d.status)) {
@@ -561,50 +570,94 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         </div>
       )}
 
-      {/* ── RECIPIENT OTP MODAL ───────────────────────────────────────────────── */}
-      {showOtpModal && amRecip && delivery?.passcode && (
+      {/* ── RECIPIENT PASSCODE INPUT MODAL ───────────────────────────────────── */}
+      {showOtpModal && amRecip && delivery && (
         <div className="modal-overlay">
-          <div className="modal" style={{ textAlign: 'center', maxWidth: 380 }}>
+          <div className="modal" style={{ textAlign: 'center', maxWidth: 400 }}>
             <div style={{ ...M, fontSize: 10, color: 'var(--amber)', textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 8 }}>
               📦 Incoming Delivery
             </div>
             <h2 style={{ ...M, fontSize: 15, marginBottom: 6 }}>
-              {allProfiles.find(p => p.id === delivery.sender_id)?.name || 'Someone'} is sending you a package
+              {allProfiles.find(p => p.id === delivery.sender_id)?.name || 'Someone'} sent you a package
             </h2>
-            <p style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 24 }}>
+            <p style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 20 }}>
               {botStatus === 'at_delivery'
-                ? '⚡ The bot is at your station. Enter this passcode on the physical keypad.'
-                : 'Bot is on its way. Enter this code on the keypad when it arrives.'}
+                ? '⚡ Bot is at your station. Read the OTP from the LCD screen and enter it below.'
+                : '🚚 Bot is on its way. Get ready — OTP will show on the LCD when it arrives.'}
             </p>
 
-            <div style={{
-              padding: '24px 0',
-              background: '#0a0a0a',
-              border: '2px solid var(--amber)',
-              borderRadius: 4,
-              marginBottom: 20,
-            }}>
-              <div style={{ ...M, fontSize: 11, color: 'var(--muted)', marginBottom: 8 }}>YOUR PASSCODE</div>
-              <div style={{ ...M, fontSize: 52, color: 'var(--amber)', letterSpacing: 16, fontWeight: 700 }}>
-                {delivery.passcode}
-              </div>
-              <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 10 }}>
-                Press # on the keypad to confirm after entering
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 20 }}>
               <InfoBox label="From" value={allProfiles.find(p => p.id === delivery.sender_id)?.name || '—'} />
               <InfoBox label="Destination" value={locations.find(l => l.id === delivery.delivery_location_id)?.label || '—'} />
             </div>
 
-            <button
-              className="btn"
-              style={{ width: '100%', marginTop: 12 }}
-              onClick={() => setShowOtpModal(false)}
-            >
-              Got it — I have the code
-            </button>
+            {recipientLocked ? (
+              <div style={{
+                padding: 16, background: 'rgba(239,68,68,0.08)',
+                border: '1px solid rgba(239,68,68,0.4)', borderRadius: 4,
+                ...M, fontSize: 11, color: 'var(--red)'
+              }}>
+                🔒 Too many wrong attempts. Contact the sender.
+              </div>
+            ) : (
+              <>
+                <div style={{ marginBottom: 8, textAlign: 'left' }}>
+                  <span className="label">Enter OTP shown on bot LCD</span>
+                  <input
+                    className="input"
+                    type="text"
+                    maxLength={4}
+                    placeholder="e.g. 2222"
+                    value={recipientInput}
+                    disabled={botStatus !== 'at_delivery'}
+                    onChange={e => setRecipientInput(e.target.value.replace(/\D/g, ''))}
+                    style={{ fontSize: 24, letterSpacing: 8, textAlign: 'center' }}
+                  />
+                  {botStatus !== 'at_delivery' && (
+                    <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 4 }}>
+                      Waiting for bot to arrive...
+                    </div>
+                  )}
+                </div>
+
+                {recipientAttempts > 0 && (
+                  <div style={{ ...M, fontSize: 11, color: 'var(--red)', marginBottom: 8 }}>
+                    ✕ Wrong passcode — attempt {recipientAttempts}/3
+                  </div>
+                )}
+
+                <button
+                  className="btn btn-amber"
+                  style={{ width: '100%' }}
+                  disabled={recipientInput.length !== 4 || botStatus !== 'at_delivery'}
+                  onClick={async () => {
+                    if (recipientInput === delivery.passcode) {
+                      // Correct — tell R4 to open the servo
+                      publishCommand({ action: 'open_lid' })
+                      setShowOtpModal(false)
+                      setRecipientInput('')
+                      setRecipientAttempts(0)
+                      showToast('✓ Correct! Box opening...')
+                    } else {
+                      const attempts = recipientAttempts + 1
+                      setRecipientAttempts(attempts)
+                      setRecipientInput('')
+                      // Tell R4 to flash "Wrong" on LCD
+                      publishCommand({ action: 'wrong_passcode' })
+                      if (attempts >= 3) {
+                        setRecipientLocked(true)
+                        publishCommand({ action: 'wrong_passcode_locked' } as any)
+                        showToast('🔒 Locked after 3 wrong attempts')
+                      } else {
+                        showToast(\`✕ Wrong passcode — \${attempts}/3 attempts\`)
+                      }
+                    }
+                  }}
+                >
+                  Unlock Box →
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}
