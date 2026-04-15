@@ -104,6 +104,8 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   const [recipientId, setRecipient]   = useState('')
   const [destId, setDest]             = useState('')
   const [passcode, setPasscode]       = useState('')
+  const [callError, setCallError]     = useState<string | null>(null)
+  const [calling, setCalling]         = useState(false)
 
   // Refs for stable access inside MQTT/realtime callbacks (avoids stale closures)
   const deliveryRef  = useRef<Delivery | null>(initialDelivery)
@@ -172,11 +174,26 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     const ch = supabase.channel('rt')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'deliveries' }, ({ new: r }) => {
         const d = r as Delivery
-        // Only adopt this delivery if it's for us (sender or recipient)
-        if (d.sender_id === userId || d.recipient_id === userId) {
-          setDelivery(d)
-          deliveryRef.current = d
-          addLog(`DB: delivery status → ${d.status}`)
+        if (d.sender_id !== userId && d.recipient_id !== userId) return
+
+        setDelivery(d)
+        deliveryRef.current = d
+        addLog(`DB: delivery → ${d.status}`)
+
+        // ── MODAL TRIGGERS FROM DB STATE (reliable, not MQTT-dependent) ──────
+        // Sender: show dispatch modal when load is secured
+        if (d.sender_id === userId && d.status === 'loading') {
+          setShowSetup(true)
+        }
+        // Recipient: show OTP modal when package is dispatched their way
+        if (d.recipient_id === userId && d.passcode &&
+            ['in_transit', 'at_delivery'].includes(d.status)) {
+          setShowOtpModal(true)
+        }
+        // Clean up modals when delivery is done
+        if (['idle', 'returning', 'delivered'].includes(d.status)) {
+          setShowSetup(false)
+          setShowOtpModal(false)
         }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_state' }, ({ new: r }) => {
@@ -220,15 +237,14 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
       showToast('✓ Bot back at base.')
     }
 
-    // ── 3. LOAD RECEIVED — trigger sender dispatch modal ─────────────────────
+    // ── 3. LOAD RECEIVED — update DB, modal fires via realtime ──────────────
     else if (event === 'load_received') {
       if (status === 'at_pickup' || status === 'going_pickup' || status === 'loading') {
         if (sender === userId) {
           await patchDelivery({ status: 'loading', load_detected: true })
           await patchBot({ status: 'loading' })
-          // Show dispatch modal so sender can set destination + passcode
-          setShowSetup(true)
-          showToast('✓ Load secured — set destination & passcode.')
+          // setShowSetup is triggered by the DB realtime update above ↑
+          addLog('Load received — dispatch modal should open')
         }
       }
     }
@@ -269,19 +285,40 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
   // ── CALL BOT ──────────────────────────────────────────────────────────────
   async function callBot() {
-    if (!myLoc) return showToast('No location assigned to your profile')
+    setCallError(null)
 
-    const { data: nd } = await supabase.from('deliveries')
-      .insert({ status: 'going_pickup', sender_id: userId, pickup_location_id: myLoc.id })
-      .select().single()
+    // Bail early with a VISIBLE inline error (not just a toast)
+    if (!myLoc) {
+      const msg = 'Your profile has no location assigned. Check Supabase: profiles → location_id'
+      setCallError(msg)
+      addLog('ERROR: ' + msg)
+      return
+    }
 
-    if (nd) {
-      setDelivery(nd as Delivery)
-      deliveryRef.current = nd as Delivery
-      await patchBot({ status: 'going_pickup', delivery_id: nd.id })
-      publishCommand({ action: 'call', pickup: myLoc.id })
-      addLog(`Bot called to ${myLoc.label}`)
-      showToast(`Bot en route to ${myLoc.label}`)
+    setCalling(true)
+    try {
+      const { data: nd, error } = await supabase
+        .from('deliveries')
+        .insert({ status: 'going_pickup', sender_id: userId, pickup_location_id: myLoc.id })
+        .select()
+        .single()
+
+      if (error) throw error
+
+      if (nd) {
+        setDelivery(nd as Delivery)
+        deliveryRef.current = nd as Delivery
+        await patchBot({ status: 'going_pickup', delivery_id: nd.id })
+        publishCommand({ action: 'call', pickup: myLoc.id })
+        addLog(`Bot called to ${myLoc.label}`)
+        showToast(`Bot en route to ${myLoc.label}`)
+      }
+    } catch (err: any) {
+      const msg = err?.message || 'Unknown error calling bot'
+      setCallError(msg)
+      addLog('ERROR calling bot: ' + msg)
+    } finally {
+      setCalling(false)
     }
   }
 
@@ -359,9 +396,36 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
             {/* IDLE — sender can call the bot */}
             {botIdle && (
-              <button className="btn btn-amber" onClick={callBot}>
-                ↗ Request Bot to {myLoc?.label || 'My Station'}
-              </button>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <button
+                  className="btn btn-amber"
+                  onClick={callBot}
+                  disabled={calling || !myLoc}
+                  style={{ opacity: !myLoc ? 0.5 : 1 }}
+                >
+                  {calling ? 'Calling bot...' : `↗ Request Bot to ${myLoc?.label || '???'}`}
+                </button>
+                {!myLoc && (
+                  <div style={{
+                    fontFamily: 'JetBrains Mono,monospace', fontSize: 10,
+                    color: 'var(--red)', padding: '6px 10px',
+                    border: '1px solid rgba(239,68,68,0.3)', borderRadius: 2,
+                    background: 'rgba(239,68,68,0.05)',
+                  }}>
+                    ✕ No location set on your profile. Go to Supabase → profiles → set location_id for your user UUID.
+                  </div>
+                )}
+                {callError && (
+                  <div style={{
+                    fontFamily: 'JetBrains Mono,monospace', fontSize: 10,
+                    color: 'var(--red)', padding: '6px 10px',
+                    border: '1px solid rgba(239,68,68,0.3)', borderRadius: 2,
+                    background: 'rgba(239,68,68,0.05)',
+                  }}>
+                    ✕ {callError}
+                  </div>
+                )}
+              </div>
             )}
 
             {/* BOT EN ROUTE TO PICKUP — waiting */}
