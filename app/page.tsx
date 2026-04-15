@@ -1,44 +1,44 @@
-import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
-import LoginForm from '@/components/LoginForm'
+import { redirect } from 'next/navigation'
+import Dashboard from '@/components/Dashboard'
 
-export default async function HomePage() {
+export default async function DashboardPage() {
   const supabase = createClient()
+  
+  // 1. Get the current logged-in user's Auth ID
   const { data: { user } } = await supabase.auth.getUser()
-  if (user) redirect('/dashboard')
+  if (!user) redirect('/')
+
+  // 2. Fetch ONLY the profile matching this ID
+  // Use .eq('id', user.id) to ensure you don't get Alice every time
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('*, location:locations(*)')
+    .eq('id', user.id) // <--- CRITICAL FILTER
+    .single()
+
+  // 3. Fetch other necessary data for the dashboard
+  const { data: locations } = await supabase.from('locations').select('*')
+  const { data: allProfiles } = await supabase.from('profiles').select('*, location:locations(*)')
+  const { data: botState } = await supabase.from('bot_state').select('*').single()
+  
+  // Get the most recent active delivery for this specific user
+  const { data: delivery } = await supabase
+    .from('deliveries')
+    .select('*')
+    .or(`sender_id.eq.${user.id},recipient_id.eq.${user.id}`)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
 
   return (
-    <div style={{
-      minHeight: '100vh', display: 'flex',
-      alignItems: 'center', justifyContent: 'center', padding: '20px',
-    }}>
-      <div style={{ width: '100%', maxWidth: '380px' }}>
-        <div style={{ marginBottom: '40px' }}>
-          <div style={{
-            fontFamily: 'JetBrains Mono, monospace', fontSize: '10px',
-            color: 'var(--amber)', letterSpacing: '0.2em',
-            textTransform: 'uppercase', marginBottom: '12px',
-          }}>
-            ◆ EPP — Autonomous Delivery
-          </div>
-          <h1 style={{
-            fontFamily: 'JetBrains Mono, monospace', fontSize: '28px',
-            fontWeight: 300, color: 'var(--text)', margin: 0,
-            letterSpacing: '-0.02em', lineHeight: 1.2,
-          }}>
-            mbot<br />
-            <span style={{ color: 'var(--amber)', fontWeight: 600 }}>DELIVERY</span>
-          </h1>
-          <div style={{ width: '40px', height: '2px', background: 'var(--amber)', marginTop: '16px' }} />
-        </div>
-        <LoginForm />
-        <div style={{
-          marginTop: '32px', fontFamily: 'JetBrains Mono, monospace',
-          fontSize: '10px', color: 'var(--muted)', textAlign: 'center', letterSpacing: '0.05em',
-        }}>
-          NUS EPP PROJECT — 2025
-        </div>
-      </div>
-    </div>
+    <Dashboard 
+      userId={user.id} 
+      profile={profile} 
+      locations={locations || []}
+      allProfiles={allProfiles || []}
+      initialDelivery={delivery}
+      initialBotState={botState}
+    />
   )
 }
