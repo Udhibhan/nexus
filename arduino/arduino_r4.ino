@@ -328,9 +328,12 @@ void onMqttMessage(int) {
   const char* action = doc["action"] | "";
 
   // ── call: go to pickup location ─────────────────────────────
-  if (strcmp(action, "call") == 0 && state == S_IDLE) {
+  if (strcmp(action, "call") == 0) {
     const char* pickup = doc["pickup"] | "homebase";
-    sendGoto(locationToByte(pickup));
+    byte loc = locationToByte(pickup);
+    Serial.println("-> Serial1 GOTO 0x" + String(loc, HEX) + " (prev state=" + String(state) + ")");
+    resetState();   // clear any stuck state first
+    sendGoto(loc);
     state = S_GOING_PICKUP;
     lcdClear();
     lcdLine(0, "Going to pickup");

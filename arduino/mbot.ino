@@ -32,7 +32,7 @@
 MeLineFollower    lineFinder(PORT_2);
 MeDCMotor         leftMotor(M1);
 MeDCMotor         rightMotor(M2);
-LiquidCrystal_I2C lcd(0x27, 16, 2);   // try 0x3F if screen stays blank
+LiquidCrystal_I2C lcd(0x3F, 16, 2);   // change to 0x27 if still blank
 
 // ── Motion tuning ────────────────────────────────────────────
 // Adjust TURN_TIME_90 until a 90° in-place turn is exact on your surface.
