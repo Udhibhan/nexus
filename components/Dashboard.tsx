@@ -213,6 +213,21 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     return () => { supabase.removeChannel(ch) }
   }, [userId])
 
+  // ── On mount: restore OTP modal if this user is already the recipient ──────
+  // Handles page reload — showOtpModal starts false so we explicitly check
+  // initialDelivery/initialBotState on mount without waiting for realtime.
+  useEffect(() => {
+    if (
+      initialDelivery?.recipient_id === userId &&
+      initialDelivery?.passcode &&
+      initialBotState?.status &&
+      ['in_transit', 'at_delivery'].includes(initialBotState.status)
+    ) {
+      setShowOtpModal(true)
+      addLog('Restored OTP modal from initial state')
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Recipient delivery poll ──────────────────────────────────────────────
   // Realtime sometimes misses the delivery assignment (RLS timing: the row is
   // created without recipient_id, then updated to add it — the initial INSERT
@@ -643,15 +658,12 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
                     maxLength={4}
                     placeholder="e.g. 2222"
                     value={recipientInput}
-                    disabled={botStatus !== 'at_delivery'}
                     onChange={e => setRecipientInput(e.target.value.replace(/\D/g, ''))}
                     style={{ fontSize: 24, letterSpacing: 8, textAlign: 'center' }}
                   />
-                  {botStatus !== 'at_delivery' && (
-                    <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 4 }}>
-                      Waiting for bot to arrive...
-                    </div>
-                  )}
+                  <div style={{ ...M, fontSize: 10, color: botStatus === 'at_delivery' ? 'var(--amber)' : 'var(--muted)', marginTop: 4 }}>
+                    {botStatus === 'at_delivery' ? '⚡ Bot is here — enter OTP from LCD' : '🚚 Bot en route — OTP will show on LCD when it arrives'}
+                  </div>
                 </div>
 
                 {recipientAttempts > 0 && (
@@ -663,7 +675,7 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
                 <button
                   className="btn btn-amber"
                   style={{ width: '100%' }}
-                  disabled={recipientInput.length !== 4 || botStatus !== 'at_delivery'}
+                  disabled={recipientInput.length !== 4}
                   onClick={async () => {
                     if (recipientInput === delivery.passcode) {
                       // Correct — tell R4 to open the servo
