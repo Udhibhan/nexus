@@ -136,9 +136,11 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   // MQTT — async dynamic import, safe in Next.js client components
   useEffect(() => {
     let mounted = true
-    import('mqtt').then(({ connect }) => {
+    import('mqtt').then((mod) => {
+      const m = mod as Record<string, unknown>
+      const connectFn = (typeof m.connect === 'function' ? m.connect : (m.default as Record<string,unknown>)?.connect ?? m.default) as (url: string, opts: object) => import('mqtt').MqttClient
       if (!mounted) return
-      const c = connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
+      const c = connectFn(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
         clientId: `mbot_web_${Math.random().toString(16).slice(2, 8)}`,
         username:  process.env.NEXT_PUBLIC_MQTT_USERNAME,
         password:  process.env.NEXT_PUBLIC_MQTT_PASSWORD,
