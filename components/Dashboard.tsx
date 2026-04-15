@@ -237,15 +237,17 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
       showToast('✓ Bot back at base.')
     }
 
-    // ── 3. LOAD RECEIVED — update DB, modal fires via realtime ──────────────
+    // ── 3. LOAD RECEIVED ─────────────────────────────────────────────────────
     else if (event === 'load_received') {
-      if (status === 'at_pickup' || status === 'going_pickup' || status === 'loading') {
-        if (sender === userId) {
-          await patchDelivery({ status: 'loading', load_detected: true })
-          await patchBot({ status: 'loading' })
-          // setShowSetup is triggered by the DB realtime update above ↑
-          addLog('Load received — dispatch modal should open')
-        }
+      addLog(`load_received: status=${status} sender=${sender} userId=${userId}`)
+      if (sender === userId) {
+        await patchDelivery({ status: 'loading', load_detected: true })
+        await patchBot({ status: 'loading' })
+        // Trigger modal directly — don't wait for realtime (patchDelivery may fail silently)
+        setShowSetup(true)
+        showToast('✓ Load secured — set destination & passcode.')
+      } else {
+        addLog(`load_received SKIPPED: sender mismatch`)
       }
     }
 
@@ -274,13 +276,15 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   // ── DB helpers ────────────────────────────────────────────────────────────
   async function patchDelivery(patch: Partial<Delivery>) {
     const id = deliveryRef.current?.id
-    if (!id) return
-    const { data } = await supabase.from('deliveries').update(patch).eq('id', id).select().single()
+    if (!id) { addLog('ERR patchDelivery: no delivery id in ref'); return }
+    const { data, error } = await supabase.from('deliveries').update(patch).eq('id', id).select().single()
+    if (error) { addLog(`ERR patchDelivery: ${error.message} (code ${error.code})`); return }
     if (data) { setDelivery(data); deliveryRef.current = data }
   }
 
   async function patchBot(patch: Partial<BotState>) {
-    await supabase.from('bot_state').update(patch).eq('id', 1)
+    const { error } = await supabase.from('bot_state').update(patch).eq('id', 1)
+    if (error) addLog(`ERR patchBot: ${error.message}`)
   }
 
   // ── CALL BOT ──────────────────────────────────────────────────────────────
