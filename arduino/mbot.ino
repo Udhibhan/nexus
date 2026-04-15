@@ -5,9 +5,9 @@ MeDCMotor leftMotor(M1);
 MeDCMotor rightMotor(M2);
 
 // ===== Motion tuning =====
-#define BASE_SPEED        175
+#define BASE_SPEED        100
 #define TURN_SPEED        140
-#define TURN_TIME_90      750
+#define TURN_TIME_90      850
 #define NODE_DEBOUNCE     600
 #define CENTER_SPEED      135
 #define POST_TURN_DELAY   80
@@ -27,7 +27,7 @@ float lastError = 0;
 int currentX = 0;
 int currentY = 0;
 int heading   = 0; // 0=N,1=E,2=S,3=W
-bool expectingCoord = false;
+
 // Track what phase the bot is in
 // 0 = idle at home
 // 1 = went to pickup, waiting for delivery command
@@ -184,56 +184,50 @@ void goTo(int targetX, int targetY) {
 }
 
 // ── Serial command handler ───────────────────────────────
-void handleBinaryCommand(byte b) {
-  if (expectingCoord) {
-    expectingCoord = false;
-    // Unpack (x << 4) | y
-    int x = b >> 4;
-    int y = b & 0x0F;
+void handleSerial(String input) {
+  input.trim();
+  if (input.length() == 0) return;
 
-    goTo(x, y);
-
-    // Report arrival back to R4
-    if (x == 0 && y == 0) {
-      botPhase = 0;
-      Serial.write(0xD1); // EVT_ARRIVED byte
-      Serial.write(0x00); // Home coord (0,0)
-    } else {
-      if (botPhase == 0) botPhase = 1;
-      else if (botPhase == 1) botPhase = 2;
-
-      Serial.write(0xD1); // EVT_ARRIVED byte
-      Serial.write(b);    // Echo back the coord byte it arrived at
-    }
+  // "PASSCODE_OK" — correct OTP entered on keypad, return to home
+  if (input == "PASSCODE_OK") {
+    goTo(0, 0);
+    botPhase = 0;
+    Serial.println("HOME");
     return;
   }
 
-  switch (b) {
-    case 0xA1: // CMD_GOTO
-      expectingCoord = true;
-      break;
+  // Coordinate command: "x,y"
+  int commaIndex = input.indexOf(',');
+  if (commaIndex == -1) return;
 
-    case 0xC1: // CMD_RETURN_HOME
-      goTo(0, 0);
-      botPhase = 0;
-      Serial.write(0xD1);
-      Serial.write(0x00);
-      break;
+  int x = input.substring(0, commaIndex).toInt();
+  int y = input.substring(commaIndex + 1).toInt();
 
-    // Add cases for 0xB1 (Open Lid) or 0xB2 (Close Lid) if you have servos
+  goTo(x, y);
+
+  // Report arrival based on phase
+  if (botPhase == 0) {
+    botPhase = 1;
+    Serial.println("ARRIVED");
+  } else if (botPhase == 1) {
+    botPhase = 2;
+    Serial.println("ARRIVED_DELIVERY");
+  } else if (botPhase == 2) {
+    // return_home command received while at delivery
+    botPhase = 0;
+    Serial.println("HOME");
   }
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   lastNodeTime = millis();
-  // Signal ready
   Serial.println("READY");
 }
 
 void loop() {
   if (Serial.available()) {
-    byte b = Serial.read();
-    handleBinaryCommand(b);
+    String input = Serial.readStringUntil('\n');
+    handleSerial(input);
   }
 }
