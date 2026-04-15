@@ -114,7 +114,6 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   const [recipientId, setRecipient] = useState('')
   const [destId, setDest]           = useState('')
   const [passcode, setPasscode]     = useState('')
-  const [entered, setEntered]       = useState('')
   const mqttRef = useRef<MqttClient | null>(null)
 
   const addLog = useCallback((msg: string) => {
@@ -177,32 +176,45 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
   async function handleEvent(event: MqttStatusEvent) {
     addLog(`Event: ${event}`)
-    if (event === 'arrived_pickup' || event === 'arrived_location') {
-      // Determine context: if bot was going to pickup, this is a pickup arrival
+
+    if (event === 'arrived_location') {
+      // Context: going_pickup → at_pickup;  in_transit → at_delivery
       if (botStatus === 'going_pickup' || !delivery?.delivery_location_id) {
         await patchDelivery({ status: 'at_pickup' })
         await patchBot({ status: 'at_pickup', current_x: myLoc?.x ?? 0, current_y: myLoc?.y ?? 0 })
         if (amSender) setShowSetup(true)
-        showToast('Bot arrived at pickup location')
+        showToast('Bot arrived at pickup — load your item')
       } else {
-        // It's a delivery arrival
         await patchDelivery({ status: 'at_delivery' })
         const dLoc = locations.find(l => l.id === delivery?.delivery_location_id)
         if (dLoc) await patchBot({ status: 'at_delivery', current_x: dLoc.x, current_y: dLoc.y })
-        if (amRecip) { setShowEntry(true); showToast('Bot arrived — enter your passcode') }
+        // Recipient: show their passcode so they can type it on the keypad
+        if (amRecip) { setShowEntry(true); showToast('Bot arrived — enter your code on the keypad') }
+        if (amSender) showToast('Bot arrived at destination')
       }
+
     } else if (event === 'load_detected') {
-      await patchDelivery({ status: 'loading', load_detected: true })
-      if (amSender) showToast('✓ Load detected — ready to dispatch')
+      await patchDelivery({ load_detected: true })
+      if (amSender) showToast('✓ Load detected on bot')
+
     } else if (event === 'load_removed') {
-      await patchDelivery({ status: 'delivered' })
-      publishCommand({ action: 'return_home' })
+      // R4 auto-returns after 3 s — just update DB
+      await patchDelivery({ status: 'returning' })
+      await patchBot({ status: 'returning' })
+      showToast('Package collected — bot returning home')
+
     } else if (event === 'box_opened') {
       await patchDelivery({ status: 'delivered' })
       showToast('✓ Box opened — collect your package')
       setShowEntry(false)
+
     } else if (event === 'wrong_passcode') {
-      showToast('✕ Wrong passcode — try again')
+      if (amRecip) showToast('✕ Wrong passcode — try again on the keypad')
+
+    } else if (event === 'wrong_passcode_locked') {
+      showToast('⚠ Bot locked — wrong passcode entered 3 times')
+      addLog('BOT LOCKED — contact admin to reset')
+
     } else if (event === 'arrived_home') {
       await patchBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
       if (delivery?.id) await supabase.from('deliveries').update({ status: 'idle' }).eq('id', delivery.id)
@@ -236,21 +248,11 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
     if (!recipientId || !destId) return showToast('Select recipient and destination')
     await patchDelivery({ status: 'in_transit', recipient_id: recipientId, delivery_location_id: destId, passcode })
     await patchBot({ status: 'in_transit' })
-    publishCommand({ action: 'deliver', delivery: destId })
+    // Include passcode so R4 can verify it locally on the keypad
+    publishCommand({ action: 'deliver', delivery: destId, passcode })
     setShowSetup(false)
-    showToast('Package dispatched')
-    addLog(`Dispatching to ${destId}`)
-  }
-
-  async function submitCode() {
-    if (entered.length !== 4) return
-    if (entered === delivery?.passcode) {
-      publishCommand({ action: 'open_lid' })
-      addLog('Correct passcode — opening lid')
-    } else {
-      showToast('✕ Wrong passcode')
-      setEntered('')
-    }
+    showToast('Package dispatched — bot will navigate when load is confirmed')
+    addLog(`Dispatching to ${destId} with passcode`)
   }
 
   async function logout() { await supabase.auth.signOut(); router.push('/') }
@@ -347,8 +349,8 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
             {botStatus === 'at_delivery' && amRecip && (
               <div>
-                <StatusMsg icon="✓" text="Bot has arrived at your station." color="var(--green)" />
-                <button className="btn btn-amber" onClick={() => setShowEntry(true)} style={{ marginTop: 12 }}>Enter Passcode →</button>
+                <StatusMsg icon="✓" text="Bot has arrived. Type your code on the bot keypad and press #." color="var(--green)" />
+                <button className="btn btn-amber" onClick={() => setShowEntry(true)} style={{ marginTop: 12 }}>Show My Code →</button>
               </div>
             )}
 
@@ -428,29 +430,23 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         </div>
       )}
 
-      {/* Passcode entry modal */}
+      {/* Passcode display modal (recipient sees their code, enters it on bot keypad) */}
       {showEntry && (
         <div className="modal-overlay" onClick={() => setShowEntry(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
             <div style={{ ...M, fontSize: 10, color: 'var(--amber)', letterSpacing: '0.15em', marginBottom: 8 }}>◆ PACKAGE AWAITING</div>
-            <h2 style={{ ...M, fontSize: 18, fontWeight: 300, marginBottom: 6 }}>Enter Passcode</h2>
-            <p style={{ ...M, fontSize: 11, color: 'var(--muted)', marginBottom: 20, lineHeight: 1.6 }}>Enter the 4-digit code you received — on screen here, or via the bot keypad.</p>
+            <h2 style={{ ...M, fontSize: 18, fontWeight: 300, marginBottom: 6 }}>Your Delivery Code</h2>
+            <p style={{ ...M, fontSize: 11, color: 'var(--muted)', marginBottom: 20, lineHeight: 1.6 }}>Type this code on the bot&apos;s keypad, then press <strong style={{ color: 'var(--text)' }}>#</strong> to unlock the lid.</p>
             {delivery?.passcode && (
-              <div style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 2, padding: '12px 16px', marginBottom: 20, textAlign: 'center' }}>
-                <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 4 }}>YOUR CODE</div>
-                <div style={{ ...M, fontSize: 40, fontWeight: 700, color: 'var(--amber)', letterSpacing: 16 }}>{delivery.passcode}</div>
+              <div style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 2, padding: '20px 16px', marginBottom: 20, textAlign: 'center' }}>
+                <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 8 }}>YOUR CODE</div>
+                <div style={{ ...M, fontSize: 48, fontWeight: 700, color: 'var(--amber)', letterSpacing: 16 }}>{delivery.passcode}</div>
               </div>
             )}
-            <div style={{ marginBottom: 20 }}>
-              <span className="label">Passcode</span>
-              <input className="input" type="text" maxLength={4} placeholder="_ _ _ _" value={entered}
-                onChange={e => setEntered(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                style={{ letterSpacing: '0.5em', fontSize: 24, textAlign: 'center' }} autoFocus />
-            </div>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <button className="btn" onClick={() => setShowEntry(false)}>Close</button>
-              <button className="btn btn-amber" onClick={submitCode} disabled={entered.length !== 4} style={{ flex: 1 }}>Submit →</button>
-            </div>
+            <p style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 20, lineHeight: 1.6 }}>
+              Press <strong style={{ color: 'var(--text)' }}>*</strong> to backspace. After 3 wrong attempts the bot locks and the sender is notified.
+            </p>
+            <button className="btn btn-amber" onClick={() => setShowEntry(false)} style={{ width: '100%' }}>Got it</button>
           </div>
         </div>
       )}
