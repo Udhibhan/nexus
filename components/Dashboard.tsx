@@ -2,433 +2,452 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
-import type { Location, Profile, Delivery, BotState } from '@/lib/types'
+import { TOPICS, publishCommand } from '@/lib/mqtt'
+import type { MqttClient } from 'mqtt'
+import type { Location, Profile, Delivery, BotState, MqttStatusEvent } from '@/lib/types'
 
-const PREFIX = process.env.NEXT_PUBLIC_MQTT_TOPIC_PREFIX ?? 'mbot_epp_2025'
-const TOPICS = {
-  command: `${PREFIX}/command`,
-  status:  `${PREFIX}/status`,
+const STATUS_LABELS: Record<string, string> = {
+  idle:         'Idle — at home base',
+  going_pickup: 'En route to pickup',
+  at_pickup:    'Arrived at pickup',
+  loading:      'Awaiting load',
+  in_transit:   'Delivering',
+  at_delivery:  'Arrived at delivery',
+  delivered:    'Load collected',
+  returning:    'Returning to base',
 }
 
-// ── Status labels ─────────────────────────────────────────
-const STATUS_LABEL: Record<string, string> = {
-  idle:             'Idle at home base',
-  going_pickup:     'Navigating to pickup…',
-  at_pickup:        'At pickup — awaiting load details',
-  in_transit:       'Delivering…',
-  at_delivery:      'At delivery — awaiting passcode',
-  returning:        'Returning to base…',
+const STATUS_DOT: Record<string, string> = {
+  idle:         'dot-gray',
+  going_pickup: 'dot-amber',
+  at_pickup:    'dot-green',
+  loading:      'dot-amber',
+  in_transit:   'dot-amber',
+  at_delivery:  'dot-green',
+  delivered:    'dot-green',
+  returning:    'dot-amber',
+}
+
+const STATUS_ORDER = ['idle','going_pickup','at_pickup','loading','in_transit','at_delivery','delivered','returning']
+function isAfterOrEqual(current: string, target: string) {
+  return STATUS_ORDER.indexOf(current) >= STATUS_ORDER.indexOf(target)
 }
 
 interface Props {
   userId:          string
-  profile:         Profile & { location?: Location } | null
+  profile:         (Profile & { location?: Location }) | null
   locations:       Location[]
   allProfiles:     (Profile & { location?: Location })[]
   initialDelivery: Delivery | null
   initialBotState: BotState | null
 }
 
-export default function Dashboard({
-  userId, profile, locations, allProfiles,
-  initialDelivery, initialBotState
-}: Props) {
-  const router    = useRouter()
-  const supabase  = createClient()
-  const mqttRef   = useRef<import('mqtt').MqttClient | null>(null)
+function GridMap({ locations, botX, botY }: { locations: Location[], botX: number, botY: number }) {
+  const maxX = Math.max(...locations.map(l => l.x), 3)
+  const maxY = Math.max(...locations.map(l => l.y), 2)
+  const cols = maxX + 1
+  const locMap: Record<string, Location> = {}
+  locations.forEach(l => { locMap[`${l.x},${l.y}`] = l })
 
-  const [mqttOk,    setMqttOk]    = useState(false)
-  const [delivery,  setDelivery]  = useState<Delivery | null>(initialDelivery)
-  const [botState,  setBotState]  = useState<BotState | null>(initialBotState)
-  const [toast,     setToast]     = useState<string | null>(null)
-  const [log,       setLog]       = useState<string[]>([])
+  const grid = []
+  for (let y = maxY; y >= 0; y--) {
+    for (let x = 0; x < cols; x++) {
+      const loc   = locMap[`${x},${y}`]
+      const isBot = botX === x && botY === y
+      grid.push(
+        <div key={`${x},${y}`}
+          className={`grid-cell${loc ? ' has-location' : ''}${loc?.is_home ? ' is-home' : ''}${isBot ? ' bot-here' : ''}`}
+          style={{ minHeight: '60px', position: 'relative' }}
+        >
+          {isBot && <div style={{ position: 'absolute', top: 4, right: 4, fontSize: 14 }}>🤖</div>}
+          {loc ? (
+            <div style={{ textAlign: 'center', lineHeight: 1.3 }}>
+              <div style={{ fontSize: 8, color: 'var(--muted)' }}>{x},{y}</div>
+              <div style={{ fontSize: 9, color: loc.is_home ? 'var(--amber)' : 'var(--text)', marginTop: 2 }}>
+                {loc.label}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 8, color: '#222' }}>{x},{y}</div>
+          )}
+        </div>
+      )
+    }
+  }
 
-  // Delivery-setup modal (shown to sender after bot arrives at pickup)
-  const [showSetup,   setShowSetup]   = useState(false)
-  const [destId,      setDestId]      = useState('')
-  const [passcode,    setPasscode]    = useState('')
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${cols}, 1fr)`, gap: 4 }}>
+      {grid}
+    </div>
+  )
+}
 
-  // Passcode display modal (shown to recipient)
-  const [showPasscode, setShowPasscode] = useState(false)
-  const [myPasscode,   setMyPasscode]   = useState('')
+function InfoBox({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ background: '#0a0a0a', border: '1px solid var(--border)', borderRadius: 2, padding: '8px 10px' }}>
+      <div style={{ fontFamily: 'JetBrains Mono,monospace', fontSize: 9, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4 }}>{label}</div>
+      <div style={{ fontFamily: 'JetBrains Mono,monospace', fontSize: 11, color: 'var(--text)' }}>{value}</div>
+    </div>
+  )
+}
 
-  const myLocation   = profile?.location
-  const botStatus    = botState?.status ?? 'idle'
-  const amSender     = delivery?.sender_id    === userId
-  const amRecipient  = delivery?.recipient_id === userId
+function StatusMsg({ icon, text, color }: { icon: string; text: string; color: string }) {
+  return (
+    <div style={{ display: 'flex', gap: 10, padding: 12, background: '#0a0a0a', border: `1px solid ${color}33`, borderRadius: 2 }}>
+      <span style={{ color, fontSize: 14 }}>{icon}</span>
+      <span style={{ fontFamily: 'JetBrains Mono,monospace', fontSize: 11, color: 'var(--muted)', lineHeight: 1.6 }}>{text}</span>
+    </div>
+  )
+}
 
-  // ── Helpers ───────────────────────────────────────────
+export default function Dashboard({ userId, profile, locations, allProfiles, initialDelivery, initialBotState }: Props) {
+  const router   = useRouter()
+  const supabase = createClient()
+
+  const [delivery, setDelivery]     = useState<Delivery | null>(initialDelivery)
+  const [botState, setBotState]     = useState<BotState | null>(initialBotState)
+  const [mqttOk, setMqttOk]         = useState(false)
+  const [toast, setToast]           = useState<string | null>(null)
+  const [log, setLog]               = useState<string[]>([])
+  const [showSetup, setShowSetup]   = useState(false)
+  const [showEntry, setShowEntry]   = useState(false)
+  const [recipientId, setRecipient] = useState('')
+  const [destId, setDest]           = useState('')
+  const [passcode, setPasscode]     = useState('')
+  const [entered, setEntered]       = useState('')
+  const mqttRef = useRef<MqttClient | null>(null)
+
   const addLog = useCallback((msg: string) => {
     const ts = new Date().toLocaleTimeString('en-GB', { hour12: false })
-    setLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 50))
+    setLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 40))
   }, [])
 
   const showToast = useCallback((msg: string) => {
-    setToast(msg)
-    setTimeout(() => setToast(null), 4000)
+    setToast(msg); setTimeout(() => setToast(null), 4000)
   }, [])
 
-  function publish(obj: object) {
-    mqttRef.current?.publish(TOPICS.command, JSON.stringify(obj), { qos: 1 })
-  }
+  const myLoc      = profile?.location
+  const amSender   = delivery?.sender_id    === userId
+  const amRecip    = delivery?.recipient_id === userId
+  const botStatus  = botState?.status || 'idle'
+  const botIdle    = botStatus === 'idle' || !delivery
+  const others     = allProfiles.filter(p => p.id !== userId)
 
-  // ── MQTT ─────────────────────────────────────────────
+  // MQTT — async dynamic import, safe in Next.js client components
   useEffect(() => {
     let mounted = true
     import('mqtt').then(({ connect }) => {
       if (!mounted) return
-      const client = connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
+      const c = connect(process.env.NEXT_PUBLIC_MQTT_BROKER_WSS!, {
         clientId: `mbot_web_${Math.random().toString(16).slice(2, 8)}`,
-        username: process.env.NEXT_PUBLIC_MQTT_USERNAME,
-        password: process.env.NEXT_PUBLIC_MQTT_PASSWORD,
+        username:  process.env.NEXT_PUBLIC_MQTT_USERNAME,
+        password:  process.env.NEXT_PUBLIC_MQTT_PASSWORD,
         reconnectPeriod: 3000,
+        keepalive: 30,
       })
-      mqttRef.current = client
-
-      client.on('connect', () => {
-        setMqttOk(true)
-        client.subscribe(TOPICS.status)
-        addLog('MQTT connected')
-      })
-      client.on('disconnect', () => { setMqttOk(false); addLog('MQTT disconnected') })
-      client.on('error',      () => setMqttOk(false))
-      client.on('message', (_topic: string, payload: Buffer) => {
+      mqttRef.current = c
+      c.on('connect', () => { setMqttOk(true); c.subscribe(TOPICS.status); addLog('MQTT connected') })
+      c.on('close',   () => { setMqttOk(false); addLog('MQTT disconnected') })
+      c.on('message', (_t: string, payload: Buffer) => {
         try {
-          const data = JSON.parse(payload.toString()) as { event: string }
-          handleEvent(data.event)
+          const { event } = JSON.parse(payload.toString()) as { event: MqttStatusEvent }
+          handleEvent(event)
         } catch {}
       })
     })
-    return () => {
-      mounted = false
-      mqttRef.current?.end(true)
-    }
+    return () => { mounted = false; mqttRef.current?.end(true) }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── Supabase Realtime ─────────────────────────────────
+  // Supabase realtime
   useEffect(() => {
-    const ch = supabase
-      .channel('rt')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'deliveries' },
-        ({ new: row }) => setDelivery(row as Delivery))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_state' },
-        ({ new: row }) => setBotState(row as BotState))
+    const ch = supabase.channel('rt')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'deliveries' }, ({ new: r }) => {
+        setDelivery(r as Delivery); addLog(`Status → ${(r as Delivery).status}`)
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_state' }, ({ new: r }) => {
+        setBotState(r as BotState)
+      })
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ── MQTT event handler ────────────────────────────────
-  async function handleEvent(event: string) {
+  async function handleEvent(event: MqttStatusEvent) {
     addLog(`Event: ${event}`)
-
-    if (event === 'arrived_pickup') {
-      // Bot arrived at sender's location
-      await updateDelivery({ status: 'at_pickup' })
-      await updateBot({ status: 'at_pickup' })
-      // Show setup modal to sender only
-      if (amSender) {
-        setShowSetup(true)
-        showToast('Bot has arrived at your location')
+    if (event === 'arrived_pickup' || event === 'arrived_location') {
+      // Determine context: if bot was going to pickup, this is a pickup arrival
+      if (botStatus === 'going_pickup' || !delivery?.delivery_location_id) {
+        await patchDelivery({ status: 'at_pickup' })
+        await patchBot({ status: 'at_pickup', current_x: myLoc?.x ?? 0, current_y: myLoc?.y ?? 0 })
+        if (amSender) setShowSetup(true)
+        showToast('Bot arrived at pickup location')
+      } else {
+        // It's a delivery arrival
+        await patchDelivery({ status: 'at_delivery' })
+        const dLoc = locations.find(l => l.id === delivery?.delivery_location_id)
+        if (dLoc) await patchBot({ status: 'at_delivery', current_x: dLoc.x, current_y: dLoc.y })
+        if (amRecip) { setShowEntry(true); showToast('Bot arrived — enter your passcode') }
       }
-    }
-
-    if (event === 'arrived_delivery') {
-      // Bot arrived at delivery station
-      await updateDelivery({ status: 'at_delivery' })
-      await updateBot({ status: 'at_delivery' })
-      // Show passcode to recipient
-      if (amRecipient) {
-        setShowPasscode(true)
-        showToast('Bot has arrived — check your passcode')
-      }
-      if (amSender) {
-        showToast('Bot arrived at destination — waiting for recipient')
-      }
-    }
-
-    if (event === 'arrived_home') {
-      await updateBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
-      if (delivery?.id) {
-        await supabase.from('deliveries').update({ status: 'idle' }).eq('id', delivery.id)
-      }
+    } else if (event === 'load_detected') {
+      await patchDelivery({ status: 'loading', load_detected: true })
+      if (amSender) showToast('✓ Load detected — ready to dispatch')
+    } else if (event === 'load_removed') {
+      await patchDelivery({ status: 'delivered' })
+      publishCommand({ action: 'return_home' })
+    } else if (event === 'box_opened') {
+      await patchDelivery({ status: 'delivered' })
+      showToast('✓ Box opened — collect your package')
+      setShowEntry(false)
+    } else if (event === 'wrong_passcode') {
+      showToast('✕ Wrong passcode — try again')
+    } else if (event === 'arrived_home') {
+      await patchBot({ status: 'idle', current_x: 0, current_y: 0, delivery_id: null })
+      if (delivery?.id) await supabase.from('deliveries').update({ status: 'idle' }).eq('id', delivery.id)
       setDelivery(null)
-      setShowPasscode(false)
       showToast('Bot returned to home base')
     }
   }
 
-  // ── DB helpers ────────────────────────────────────────
-  async function updateDelivery(patch: Partial<Delivery>) {
+  async function patchDelivery(patch: Partial<Delivery>) {
     if (!delivery?.id) return
     await supabase.from('deliveries').update(patch).eq('id', delivery.id)
   }
 
-  async function updateBot(patch: Partial<BotState>) {
+  async function patchBot(patch: Partial<BotState>) {
     await supabase.from('bot_state').update(patch).eq('id', 1)
   }
 
-  // ── Actions ───────────────────────────────────────────
   async function callBot() {
-    if (!myLocation) return showToast('Your location is not set in your profile')
-
-    const { data: newDel } = await supabase
-      .from('deliveries')
-      .insert({ status: 'going_pickup', sender_id: userId, pickup_location_id: myLocation.id })
+    if (!myLoc) return showToast('Your location is not set — ask admin to assign it')
+    const { data: nd } = await supabase.from('deliveries')
+      .insert({ status: 'going_pickup', sender_id: userId, pickup_location_id: myLoc.id })
       .select().single()
-
-    if (newDel) {
-      setDelivery(newDel as Delivery)
-      await updateBot({ status: 'going_pickup', delivery_id: newDel.id })
-    }
-
-    publish({ action: 'call', pickup: myLocation.id })
-    addLog(`Calling bot to ${myLocation.label}`)
-    showToast(`Bot on its way to ${myLocation.label}…`)
+    if (nd) { setDelivery(nd as Delivery); await patchBot({ status: 'going_pickup', delivery_id: nd.id }) }
+    publishCommand({ action: 'call', pickup: myLoc.id })
+    showToast(`Bot en route to ${myLoc.label}`)
+    addLog(`Called bot to ${myLoc.label}`)
   }
 
-  async function confirmDelivery() {
-    if (!destId)                       return showToast('Select a destination')
-    if (passcode.length !== 4)         return showToast('Enter a 4-digit passcode')
-    if (!/^\d{4}$/.test(passcode))    return showToast('Passcode must be 4 digits')
-
-    const recipient = allProfiles.find(p => p.location_id === destId)
-
-    await updateDelivery({
-      status: 'in_transit',
-      recipient_id: recipient?.id ?? null,
-      delivery_location_id: destId,
-      passcode,
-    })
-    await updateBot({ status: 'in_transit' })
-
-    // Tell mbot to go to delivery location
-    publish({ action: 'deliver', delivery: destId })
-
-    // Show passcode to recipient via Supabase Realtime
-    // (recipient's screen polls their delivery row which now has the passcode)
-    if (recipient) {
-      // The recipient will see it because their delivery row is updated above
-      // They check: amRecipient && delivery?.passcode
-    }
-
+  async function startDelivery() {
+    if (passcode.length !== 4)   return showToast('Enter a 4-digit passcode')
+    if (!recipientId || !destId) return showToast('Select recipient and destination')
+    await patchDelivery({ status: 'in_transit', recipient_id: recipientId, delivery_location_id: destId, passcode })
+    await patchBot({ status: 'in_transit' })
+    publishCommand({ action: 'deliver', delivery: destId })
     setShowSetup(false)
-    addLog(`Dispatching to ${destId} — passcode set`)
-    showToast('Package dispatched!')
+    showToast('Package dispatched')
+    addLog(`Dispatching to ${destId}`)
   }
 
-  async function confirmPasscode() {
-    // Simulates pressing the correct passcode on the physical keypad
-    // In production this comes from the mbot keypad via Serial → R4 → MQTT
-    publish({ action: 'passcode_ok' })
-    setShowPasscode(false)
-    await updateDelivery({ status: 'returning' })
-    await updateBot({ status: 'returning' })
-    showToast('Passcode accepted — bot returning home in 3s…')
-    addLog('Passcode confirmed — bot will return home')
+  async function submitCode() {
+    if (entered.length !== 4) return
+    if (entered === delivery?.passcode) {
+      publishCommand({ action: 'open_lid' })
+      addLog('Correct passcode — opening lid')
+    } else {
+      showToast('✕ Wrong passcode')
+      setEntered('')
+    }
   }
 
-  async function logout() {
-    await supabase.auth.signOut()
-    router.push('/')
-  }
+  async function logout() { await supabase.auth.signOut(); router.push('/') }
 
-  const nonHomeLocs   = locations.filter(l => !l.is_home)
-  const otherLocs     = nonHomeLocs.filter(l => l.id !== myLocation?.id)
+  const M = { fontFamily: 'JetBrains Mono,monospace' }
 
-  // ── Render ────────────────────────────────────────────
   return (
-    <div style={{ minHeight:'100vh', padding:'24px', maxWidth:'900px', margin:'0 auto' }}>
+    <div style={{ minHeight: '100vh', padding: 24, maxWidth: 1100, margin: '0 auto' }}>
 
       {/* Top bar */}
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:'28px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 }}>
         <div>
-          <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--amber)', letterSpacing:'0.2em', textTransform:'uppercase', marginBottom:'4px' }}>
-            ◆ AILN — mbot Delivery
-          </div>
-          <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'18px', fontWeight:300 }}>
+          <div style={{ ...M, fontSize: 10, color: 'var(--amber)', letterSpacing: '0.2em', textTransform: 'uppercase', marginBottom: 4 }}>◆ mbot Delivery System</div>
+          <div style={{ ...M, fontSize: 18, fontWeight: 300 }}>
             {profile?.name || 'Operator'}
-            <span style={{ fontSize:'11px', color:'var(--muted)', marginLeft:'12px' }}>
-              @ {myLocation?.label || 'No location set'}
-            </span>
+            <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 12 }}>@ {myLoc?.label || 'no location set'}</span>
           </div>
         </div>
-        <div style={{ display:'flex', gap:'16px', alignItems:'center' }}>
-          <div style={{ display:'flex', alignItems:'center', gap:'6px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span className={`status-dot ${mqttOk ? 'dot-green' : 'dot-red'}`} />
-            <span style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--muted)' }}>
-              {mqttOk ? 'MQTT LIVE' : 'MQTT OFF'}
-            </span>
+            <span style={{ ...M, fontSize: 10, color: 'var(--muted)' }}>{mqttOk ? 'MQTT LIVE' : 'MQTT OFF'}</span>
           </div>
-          <button className="btn" onClick={logout} style={{ fontSize:'11px', padding:'6px 14px' }}>Logout</button>
+          <button className="btn" onClick={logout} style={{ fontSize: 11, padding: '6px 14px' }}>Logout</button>
         </div>
       </div>
 
-      {/* Status card */}
-      <div className="card" style={{ padding:'20px', marginBottom:'16px' }}>
-        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-          <span className="label">Bot status</span>
-          <div style={{ display:'flex', alignItems:'center', gap:'8px' }}>
-            <span className={`status-dot ${
-              botStatus === 'idle'       ? 'dot-gray'  :
-              botStatus === 'at_pickup' || botStatus === 'at_delivery' ? 'dot-green' :
-              'dot-amber'
-            }`} />
-            <span style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'12px', color:'var(--text)' }}>
-              {STATUS_LABEL[botStatus] || botStatus}
-            </span>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: 16 }}>
+
+        {/* Left */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+          {/* Bot status */}
+          <div className="card" style={{ padding: 20 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+              <span className="label">Bot status</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span className={`status-dot ${STATUS_DOT[botStatus] || 'dot-gray'}`} />
+                <span style={{ ...M, fontSize: 11 }}>{STATUS_LABELS[botStatus] || botStatus}</span>
+              </div>
+            </div>
+            {delivery && (
+              <>
+                <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                  {['going_pickup','at_pickup','loading','in_transit','at_delivery','delivered','returning'].map(s => (
+                    <div key={s} style={{ flex: 1, height: 3, borderRadius: 2, background: isAfterOrEqual(botStatus, s) ? 'var(--amber)' : 'var(--border2)', transition: 'background 0.4s' }} />
+                  ))}
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 12 }}>
+                  <InfoBox label="From"      value={locations.find(l => l.id === delivery.pickup_location_id)?.label  || '—'} />
+                  <InfoBox label="To"        value={locations.find(l => l.id === delivery.delivery_location_id)?.label || '—'} />
+                  <InfoBox label="Recipient" value={allProfiles.find(p => p.id === delivery.recipient_id)?.name         || '—'} />
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Actions */}
+          <div className="card" style={{ padding: 20 }}>
+            <span className="label" style={{ display: 'block', marginBottom: 16 }}>Actions</span>
+
+            {botIdle && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ ...M, fontSize: 11, color: 'var(--muted)', lineHeight: 1.6 }}>Bot is at home base. Call it to your location to start a delivery.</div>
+                <button className="btn btn-amber" onClick={callBot} style={{ width: 'fit-content' }}>↗ Call Bot to {myLoc?.label || 'my location'}</button>
+              </div>
+            )}
+
+            {botStatus === 'going_pickup' && amSender && <StatusMsg icon="⟳" text={`Bot is navigating to ${myLoc?.label}...`} color="var(--amber)" />}
+
+            {botStatus === 'at_pickup' && amSender && (
+              <div>
+                <StatusMsg icon="✓" text="Bot arrived. Load your item then set delivery details." color="var(--green)" />
+                <button className="btn btn-amber" onClick={() => setShowSetup(true)} style={{ marginTop: 12 }}>Set Delivery Details →</button>
+              </div>
+            )}
+
+            {delivery?.load_detected && botStatus === 'loading' && amSender && (
+              <div>
+                <StatusMsg icon="⚖" text="Load detected on platform." color="var(--green)" />
+                <button className="btn btn-amber" onClick={startDelivery} style={{ marginTop: 12 }}>▶ Start Delivery</button>
+              </div>
+            )}
+
+            {botStatus === 'in_transit' && <StatusMsg icon="⟶" text={`Delivering to ${locations.find(l => l.id === delivery?.delivery_location_id)?.label || '...'}`} color="var(--amber)" />}
+
+            {botStatus === 'in_transit' && amRecip && delivery?.passcode && (
+              <div style={{ marginTop: 16 }}>
+                <span className="label">Your incoming passcode</span>
+                <div style={{ ...M, fontSize: 40, fontWeight: 700, color: 'var(--amber)', letterSpacing: 12, marginTop: 8 }}>{delivery.passcode}</div>
+                <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 6 }}>Enter this on the bot keypad when it arrives</div>
+              </div>
+            )}
+
+            {botStatus === 'at_delivery' && amRecip && (
+              <div>
+                <StatusMsg icon="✓" text="Bot has arrived at your station." color="var(--green)" />
+                <button className="btn btn-amber" onClick={() => setShowEntry(true)} style={{ marginTop: 12 }}>Enter Passcode →</button>
+              </div>
+            )}
+
+            {botStatus === 'at_delivery' && amSender && <StatusMsg icon="⟳" text="Waiting for recipient to enter passcode..." color="var(--amber)" />}
+            {botStatus === 'returning'   && <StatusMsg icon="⟵" text="Package collected. Bot returning to home base." color="var(--amber)" />}
+          </div>
+
+          {/* Log */}
+          <div className="card" style={{ padding: 16 }}>
+            <span className="label" style={{ display: 'block', marginBottom: 10 }}>Event Log</span>
+            <div style={{ maxHeight: 130, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {log.length === 0
+                ? <span style={{ ...M, fontSize: 11, color: 'var(--muted)' }}>No events yet</span>
+                : log.map((l, i) => <div key={i} style={{ ...M, fontSize: 10, color: i === 0 ? 'var(--text)' : 'var(--muted)' }}>{l}</div>)
+              }
+            </div>
           </div>
         </div>
 
-        {delivery && (
-          <div style={{ marginTop:'14px', display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:'10px' }}>
-            {[
-              { label:'From', val: locations.find(l => l.id === delivery.pickup_location_id)?.label || '—' },
-              { label:'To',   val: locations.find(l => l.id === delivery.delivery_location_id)?.label || '—' },
-              { label:'Passcode', val: amRecipient ? (delivery.passcode || '—') : '****' },
-            ].map(({ label, val }) => (
-              <div key={label} style={{ background:'#0a0a0a', border:'1px solid var(--border)', borderRadius:'2px', padding:'8px 10px' }}>
-                <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'9px', color:'var(--muted)', textTransform:'uppercase', letterSpacing:'0.1em' }}>{label}</div>
-                <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'12px', color:'var(--text)', marginTop:'3px' }}>{val}</div>
+        {/* Right — map */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div className="card" style={{ padding: 16 }}>
+            <span className="label" style={{ display: 'block', marginBottom: 12 }}>Grid Map</span>
+            <GridMap locations={locations} botX={botState?.current_x ?? 0} botY={botState?.current_y ?? 0} />
+          </div>
+          <div className="card" style={{ padding: 16 }}>
+            <span className="label" style={{ display: 'block', marginBottom: 10 }}>Stations</span>
+            {locations.map(loc => (
+              <div key={loc.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+                <div>
+                  <div style={{ ...M, fontSize: 11, color: loc.is_home ? 'var(--amber)' : 'var(--text)' }}>{loc.label}</div>
+                  <div style={{ ...M, fontSize: 9, color: 'var(--muted)' }}>({loc.x},{loc.y})</div>
+                </div>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {loc.is_home && <span className="tag tag-amber">HOME</span>}
+                  {myLoc?.id === loc.id && !loc.is_home && <span className="tag tag-blue">YOU</span>}
+                  {botState?.current_x === loc.x && botState?.current_y === loc.y && <span className="tag tag-green">BOT</span>}
+                </div>
               </div>
             ))}
           </div>
-        )}
-      </div>
-
-      {/* Action panel */}
-      <div className="card" style={{ padding:'20px', marginBottom:'16px' }}>
-        <span className="label" style={{ display:'block', marginBottom:'14px' }}>Actions</span>
-
-        {/* IDLE → call bot */}
-        {botStatus === 'idle' && (
-          <div>
-            <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--muted)', marginBottom:'12px', lineHeight:1.6 }}>
-              Bot is at home base. Call it to your location to start a delivery.
-            </p>
-            <button className="btn btn-amber" onClick={callBot}>
-              ↗ Call Bot to {myLocation?.label || 'my location'}
-            </button>
-          </div>
-        )}
-
-        {/* Navigating to pickup */}
-        {botStatus === 'going_pickup' && amSender && (
-          <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--amber)', lineHeight:1.6 }}>
-            ⟳ Bot is navigating to {myLocation?.label}…
-          </p>
-        )}
-
-        {/* At pickup — sender needs to set destination */}
-        {botStatus === 'at_pickup' && amSender && (
-          <div>
-            <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--green)', marginBottom:'12px', lineHeight:1.6 }}>
-              ✓ Bot arrived. Place your load, then set delivery details.
-            </p>
-            <button className="btn btn-amber" onClick={() => setShowSetup(true)}>
-              Set Destination & Passcode →
-            </button>
-          </div>
-        )}
-
-        {/* In transit */}
-        {botStatus === 'in_transit' && (
-          <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--amber)', lineHeight:1.6 }}>
-            ⟶ Bot is delivering to {locations.find(l => l.id === delivery?.delivery_location_id)?.label || '…'}
-          </p>
-        )}
-
-        {/* In transit — recipient sees passcode */}
-        {botStatus === 'in_transit' && amRecipient && delivery?.passcode && (
-          <div style={{ marginTop:'16px', background:'rgba(245,158,11,0.08)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:'2px', padding:'16px', textAlign:'center' }}>
-            <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--muted)', marginBottom:'6px' }}>YOUR INCOMING PASSCODE</div>
-            <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'44px', fontWeight:700, color:'var(--amber)', letterSpacing:'14px' }}>
-              {delivery.passcode}
-            </div>
-            <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--muted)', marginTop:'6px' }}>Enter this when the bot arrives</div>
-          </div>
-        )}
-
-        {/* At delivery — recipient confirms */}
-        {botStatus === 'at_delivery' && amRecipient && (
-          <div>
-            <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--green)', marginBottom:'12px', lineHeight:1.6 }}>
-              ✓ Bot has arrived with your package.
-            </p>
-            {delivery?.passcode && (
-              <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'36px', fontWeight:700, color:'var(--amber)', letterSpacing:'12px', marginBottom:'14px' }}>
-                {delivery.passcode}
-              </div>
-            )}
-            <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--muted)', marginBottom:'12px' }}>
-              Enter the code on the bot keypad. Or click below to simulate confirmation:
-            </p>
-            <button className="btn btn-amber" onClick={confirmPasscode}>
-              ✓ Confirm Passcode (simulate keypad)
-            </button>
-          </div>
-        )}
-
-        {/* Returning */}
-        {botStatus === 'returning' && (
-          <p style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--amber)', lineHeight:1.6 }}>
-            ⟵ Bot returning to home base…
-          </p>
-        )}
-      </div>
-
-      {/* Event log */}
-      <div className="card" style={{ padding:'16px' }}>
-        <span className="label" style={{ display:'block', marginBottom:'10px' }}>Event Log</span>
-        <div style={{ maxHeight:'120px', overflowY:'auto' }}>
-          {log.length === 0
-            ? <span style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'11px', color:'var(--muted)' }}>No events yet</span>
-            : log.map((l, i) => (
-              <div key={i} style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:i===0?'var(--text)':'var(--muted)', padding:'2px 0' }}>{l}</div>
-            ))
-          }
         </div>
       </div>
 
-      {/* ── SETUP MODAL ────────────────────────────────── */}
+      {/* Delivery setup modal */}
       {showSetup && (
         <div className="modal-overlay" onClick={() => setShowSetup(false)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
-            <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--amber)', letterSpacing:'0.15em', marginBottom:'8px' }}>◆ LOAD RECEIVED</div>
-            <h2 style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'18px', fontWeight:300, marginBottom:'20px' }}>Where would you like to send this?</h2>
-
-            <div style={{ marginBottom:'14px' }}>
-              <span className="label">Destination</span>
-              <select className="select" value={destId} onChange={e => setDestId(e.target.value)}>
-                <option value="">— select destination —</option>
-                {otherLocs.map(l => (
-                  <option key={l.id} value={l.id}>{l.label} ({l.x},{l.y})</option>
-                ))}
+            <div style={{ ...M, fontSize: 10, color: 'var(--amber)', letterSpacing: '0.15em', marginBottom: 8 }}>◆ DELIVERY SETUP</div>
+            <h2 style={{ ...M, fontSize: 18, fontWeight: 300, marginBottom: 24 }}>Configure Package</h2>
+            <div style={{ marginBottom: 14 }}>
+              <span className="label">Recipient</span>
+              <select className="select" value={recipientId} onChange={e => setRecipient(e.target.value)}>
+                <option value="">— select recipient —</option>
+                {others.map(p => <option key={p.id} value={p.id}>{p.name} — {p.location?.label || 'no location'}</option>)}
               </select>
             </div>
-
-            <div style={{ marginBottom:'24px' }}>
-              <span className="label">Set Passcode (4 digits)</span>
-              <input
-                className="input"
-                type="text"
-                maxLength={4}
-                placeholder="e.g. 7432"
-                value={passcode}
-                onChange={e => setPasscode(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                style={{ letterSpacing:'0.4em', fontSize:'22px', textAlign:'center' }}
-              />
-              <div style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'10px', color:'var(--muted)', marginTop:'6px' }}>
-                Recipient at the destination will see this privately
-              </div>
+            <div style={{ marginBottom: 14 }}>
+              <span className="label">Delivery Station</span>
+              <select className="select" value={destId} onChange={e => setDest(e.target.value)}>
+                <option value="">— select destination —</option>
+                {locations.filter(l => !l.is_home).map(l => <option key={l.id} value={l.id}>{l.label} ({l.x},{l.y})</option>)}
+              </select>
             </div>
-
-            <div style={{ display:'flex', gap:'10px' }}>
+            <div style={{ marginBottom: 24 }}>
+              <span className="label">Passcode (4 digits)</span>
+              <input className="input" type="text" maxLength={4} placeholder="e.g. 7432" value={passcode}
+                onChange={e => setPasscode(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                style={{ letterSpacing: '0.3em', fontSize: 20, textAlign: 'center' }} />
+              <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginTop: 6 }}>Recipient sees this code privately on their screen</div>
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
               <button className="btn" onClick={() => setShowSetup(false)}>Cancel</button>
-              <button className="btn btn-amber" onClick={confirmDelivery} style={{ flex:1 }}>
-                Dispatch →
-              </button>
+              <button className="btn btn-amber" onClick={startDelivery} style={{ flex: 1 }}>Confirm &amp; Dispatch →</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Passcode entry modal */}
+      {showEntry && (
+        <div className="modal-overlay" onClick={() => setShowEntry(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div style={{ ...M, fontSize: 10, color: 'var(--amber)', letterSpacing: '0.15em', marginBottom: 8 }}>◆ PACKAGE AWAITING</div>
+            <h2 style={{ ...M, fontSize: 18, fontWeight: 300, marginBottom: 6 }}>Enter Passcode</h2>
+            <p style={{ ...M, fontSize: 11, color: 'var(--muted)', marginBottom: 20, lineHeight: 1.6 }}>Enter the 4-digit code you received — on screen here, or via the bot keypad.</p>
+            {delivery?.passcode && (
+              <div style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 2, padding: '12px 16px', marginBottom: 20, textAlign: 'center' }}>
+                <div style={{ ...M, fontSize: 10, color: 'var(--muted)', marginBottom: 4 }}>YOUR CODE</div>
+                <div style={{ ...M, fontSize: 40, fontWeight: 700, color: 'var(--amber)', letterSpacing: 16 }}>{delivery.passcode}</div>
+              </div>
+            )}
+            <div style={{ marginBottom: 20 }}>
+              <span className="label">Passcode</span>
+              <input className="input" type="text" maxLength={4} placeholder="_ _ _ _" value={entered}
+                onChange={e => setEntered(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                style={{ letterSpacing: '0.5em', fontSize: 24, textAlign: 'center' }} autoFocus />
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button className="btn" onClick={() => setShowEntry(false)}>Close</button>
+              <button className="btn btn-amber" onClick={submitCode} disabled={entered.length !== 4} style={{ flex: 1 }}>Submit →</button>
             </div>
           </div>
         </div>
@@ -436,13 +455,7 @@ export default function Dashboard({
 
       {/* Toast */}
       {toast && (
-        <div style={{
-          position:'fixed', bottom:'24px', left:'50%', transform:'translateX(-50%)',
-          background:'var(--surface)', border:'1px solid var(--amber)', borderRadius:'2px',
-          padding:'12px 20px', fontFamily:'JetBrains Mono, monospace', fontSize:'12px',
-          color:'var(--amber)', zIndex:999, whiteSpace:'nowrap', letterSpacing:'0.05em',
-          boxShadow:'0 4px 24px rgba(0,0,0,0.5)',
-        }}>
+        <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', background: 'var(--surface)', border: '1px solid var(--amber)', borderRadius: 2, padding: '12px 20px', ...M, fontSize: 12, color: 'var(--amber)', zIndex: 999, whiteSpace: 'nowrap', letterSpacing: '0.05em', boxShadow: '0 4px 24px rgba(0,0,0,0.5)' }}>
           {toast}
         </div>
       )}
