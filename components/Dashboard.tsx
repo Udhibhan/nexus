@@ -104,6 +104,7 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
   const [recipientInput, setRecipientInput] = useState('')
   const [recipientAttempts, setRecipientAttempts] = useState(0)
   const [recipientLocked, setRecipientLocked]     = useState(false)
+  const [otpSubmitted, setOtpSubmitted]           = useState(false) // prevents poll re-opening modal after correct entry
   const [recipientId, setRecipient]   = useState('')
   const [destId, setDest]             = useState('')
   const [passcode, setPasscode]       = useState('')
@@ -136,10 +137,14 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
 
   // Auto-show OTP modal for recipient when delivery is dispatched their way
   useEffect(() => {
-    if (amRecip && delivery?.passcode && isAfterOrEqual(botStatus, 'in_transit') && botStatus !== 'idle') {
+    if (!otpSubmitted && amRecip && delivery?.passcode && ['in_transit', 'at_delivery'].includes(botStatus)) {
       setShowOtpModal(true)
     }
-  }, [amRecip, delivery?.passcode, botStatus])
+    if (['returning', 'delivered', 'idle'].includes(botStatus)) {
+      setShowOtpModal(false)
+      setOtpSubmitted(false)
+    }
+  }, [amRecip, delivery?.passcode, botStatus, otpSubmitted])
 
   // ── MQTT ─────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -203,6 +208,7 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         if (['idle', 'returning', 'delivered'].includes(d.status)) {
           setShowSetup(false)
           setShowOtpModal(false)
+          setOtpSubmitted(false) // reset for next delivery
         }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bot_state' }, ({ new: r }) => {
@@ -253,10 +259,13 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
         setDelivery(data)
         deliveryRef.current = data
         addLog(`Poll: incoming delivery found → ${data.status}`)
-        setShowOtpModal(true)
-        setRecipientInput('')
-        setRecipientAttempts(0)
-        setRecipientLocked(false)
+        // Don't re-open if recipient already submitted correct password
+        if (!otpSubmitted) {
+          setShowOtpModal(true)
+          setRecipientInput('')
+          setRecipientAttempts(0)
+          setRecipientLocked(false)
+        }
       }
     }, 3000)
     return () => clearInterval(interval)
@@ -678,12 +687,13 @@ export default function Dashboard({ userId, profile, locations, allProfiles, ini
                   disabled={recipientInput.length !== 4}
                   onClick={async () => {
                     if (recipientInput === delivery.passcode) {
-                      // Correct — tell R4 to open the servo
+                      // Correct — tell R4 to open the servo, dismiss modal permanently
                       publishCommand({ action: 'open_lid' })
+                      setOtpSubmitted(true)   // prevent poll/realtime from re-opening modal
                       setShowOtpModal(false)
                       setRecipientInput('')
                       setRecipientAttempts(0)
-                      showToast('✓ Correct! Box opening...')
+                      showToast('✓ Correct! Servo opening — bot returns in ~5s.')
                     } else {
                       const attempts = recipientAttempts + 1
                       setRecipientAttempts(attempts)
