@@ -1,24 +1,15 @@
-// =============================================================
-// mbot Delivery — Arduino R4 WiFi
-// Bridges MQTT (cloud) <-> mbot (Serial1 via TX/RX wires)
-//
-// Libraries needed (Tools > Manage Libraries):
-//   - ArduinoMqttClient  by Arduino
-//   - ArduinoJson        by Benoit Blanchon
-//   - WiFiS3             (built in for R4 WiFi)
-// =============================================================
-
 #include <WiFiS3.h>
 #include <ArduinoMqttClient.h>
 #include <ArduinoJson.h>
 
-// -- Config: match your .env.local ----------------------------
-const char* WIFI_SSID    = "YourWiFiName";
-const char* WIFI_PASS    = "YourWiFiPass";
-const char* MQTT_BROKER  = "YOUR_CLUSTER.s2.eu.hivemq.cloud";
+// NO CA_CERT block needed
+
+const char* WIFI_SSID    = "demo";
+const char* WIFI_PASS    = "pzac1245";
+const char* MQTT_BROKER  = "0dfa135da60e491aa2523c5c40ba3f2d.s1.eu.hivemq.cloud";
 const int   MQTT_PORT    = 8883;
-const char* MQTT_USER    = "your_hivemq_username";
-const char* MQTT_PASS    = "your_hivemq_password";
+const char* MQTT_USER    = "mbot_epp";
+const char* MQTT_PASS    = "Udnirora2658@";
 const char* TOPIC_CMD    = "mbot_epp_2025/command";
 const char* TOPIC_STATUS = "mbot_epp_2025/status";
 
@@ -55,7 +46,8 @@ String coordToId(int x, int y) {
 #define EVT_LOAD_OFF    0xD3
 #define EVT_LID_OPENED  0xE1
 #define EVT_WRONG_CODE  0xE2
-
+// Forward declaration
+void publishEvent(const char* event);
 // -- MQTT + WiFi ----------------------------------------------
 WiFiSSLClient wifiClient;
 MqttClient    mqttClient(wifiClient);
@@ -66,6 +58,8 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(9600);
 
+  // NO setCACert line
+
   Serial.print("WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
@@ -73,7 +67,10 @@ void setup() {
 
   mqttClient.setUsernamePassword(MQTT_USER, MQTT_PASS);
   Serial.print("MQTT");
-  while (!mqttClient.connect(MQTT_BROKER, MQTT_PORT)) { delay(1000); Serial.print("."); }
+  while (!mqttClient.connect(MQTT_BROKER, MQTT_PORT)) {
+    Serial.print(".");
+    delay(1000);
+  }
   mqttClient.subscribe(TOPIC_CMD);
   mqttClient.onMessage(onMqttMessage);
   Serial.println(" OK");
@@ -107,12 +104,12 @@ void onMqttMessage(int) {
   if (strcmp(action, "call") == 0) {
     byte loc = locationToByte(doc["pickup"] | "homebase");
     Serial1.write(CMD_GOTO); Serial1.write(loc);
-    Serial.printf("-> GOTO pickup (%d,%d)\n", loc>>4, loc&0xF);
-  }
+    Serial.println("-> GOTO pickup (" + String(loc>>4) + "," + String(loc&0xF) + ")");  }
+
   else if (strcmp(action, "deliver") == 0) {
     byte loc = locationToByte(doc["delivery"] | "homebase");
     Serial1.write(CMD_GOTO); Serial1.write(loc);
-    Serial.printf("-> GOTO delivery (%d,%d)\n", loc>>4, loc&0xF);
+    Serial.println("-> GOTO delivery (" + String(loc>>4) + "," + String(loc&0xF) + ")");
   }
   else if (strcmp(action, "open_lid") == 0) {
     Serial1.write(CMD_OPEN_LID);
@@ -138,7 +135,7 @@ void handleMbotByte(byte b) {
     // Website tracks context so we emit a single event; it handles both cases
     const char* evt = (x==0&&y==0) ? "arrived_home" : "arrived_location";
     publishEvent(evt);
-    Serial.printf("mbot arrived at %s (%d,%d)\n", id.c_str(), x, y);
+    Serial.println("mbot arrived at " + id + " (" + String(x) + "," + String(y) + ")");    
     return;
   }
 
@@ -148,8 +145,7 @@ void handleMbotByte(byte b) {
     case EVT_LOAD_OFF:   publishEvent("load_removed");      break;
     case EVT_LID_OPENED: publishEvent("box_opened");        break;
     case EVT_WRONG_CODE: publishEvent("wrong_passcode");    break;
-    default: Serial.printf("Unknown byte 0x%02X\n", b);
-  }
+    default: Serial.print("Unknown byte 0x"); Serial.println(b, HEX);  }
 }
 
 void publishEvent(const char* event) {
